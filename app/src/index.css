@@ -1,0 +1,60 @@
+@import '@fontsource-variable/jetbrains-mono';
+@import 'tailwindcss';
+@import './design/tokens.css';
+@import './design/glass.css';
+
+/* user-chosen UI font (from trans-jimaku-web), single weight 500 */
+@font-face {
+  font-family: 'CustomUI';
+  src: url('/fonts/CustomUI-Regular.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* map tokens into tailwind theme (v4 CSS-first config) */
+@theme inline {
+  --color-base: var(--bg-base);
+  --color-surface: var(--bg-layer-1);
+  --color-sunken: var(--bg-layer-3);
+  --color-sidebar: var(--bg-sidebar);
+  --color-line-1: var(--border-1);
+  --color-line-2: var(--border-2);
+  --color-ink-1: var(--text-1);
+  --color-ink-2: var(--text-2);
+  --color-ink-3: var(--text-3);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-on-primary: var(--on-primary);
+  --color-ok: var(--success);
+  --color-warn: var(--warn);
+  --color-err: var(--error);
+  --font-ui: var(--font-ui);
+  --font-mono: var(--font-mono);
+  --radius-s: var(--radius-s);
+  --radius-m: var(--radius-m);
+  --radius-l: var(--radius-l);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  /* rounded frameless window: the transparent Tauri window shows the page
+     through, so the page itself clips its own corners */
+  border-radius: var(--window-radius);
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--text-1);
+  background: transparent; /* window transparency: wallpaper layer is body::before */
+  font-feature-settings: 'tnum';
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--primary-dim);
+}

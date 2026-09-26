@@ -1,0 +1,22 @@
+# Line endings are pinned so a checkout does not depend on the machine's
+# core.autocrlf setting. Two reasons, both learned the hard way:
+#   * scripts/bump.ps1 parses repo files with ^...$ anchored .NET regexes, and
+#     .NET's $ does not match before CRLF -- a CRLF checkout (autocrlf=true,
+#     the Git for Windows default and what GitHub's Windows runners do) made
+#     the release pipeline abort with "version field not found"
+#   * the release scripts are shared by a local machine and CI, and "works
+#     here, CRLF there" is not a difference worth debugging twice
+#
+# Everything is stored as LF in the index already, so this changes no content
+# -- only how a checkout materialises.
+* text=auto eol=lf
+
+# Binaries: never touch, never diff as text
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.exe binary
+*.zip binary

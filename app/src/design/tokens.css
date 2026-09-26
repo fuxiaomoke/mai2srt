@@ -1,0 +1,167 @@
+/* ---------------------------------------------------------------------------
+ * mai2srt design tokens -- rose (light) / ember (dark), ported verbatim from
+ * dsh-dream-skin v9.16.0 (lib/client.js + docs/design-philosophy.md).
+ * Theme switches via <html data-theme="rose|ember">; material via
+ * <html data-material="frosted|liquid">.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  /* window shape: the transparent window's page clips its own corners */
+  --window-radius: 12px;
+
+  /* typography: user-chosen CustomUI (trans-jimaku-web family) first */
+  --font-ui: 'CustomUI', 'Yu Gothic UI', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', Consolas, monospace;
+
+  /* motion */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-emph: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-in: 200ms;
+  --dur-emph: 300ms;
+  --dur-page: 400ms;
+
+  /* layout scale */
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 16px;
+
+  /* shadow: ambient, never hard */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.05), 0 4px 16px rgb(0 0 0 / 0.06);
+  --shadow-2: 0 2px 4px rgb(0 0 0 / 0.06), 0 12px 40px rgb(0 0 0 / 0.12);
+}
+
+/* ----------------------------- rose (light) ----------------------------- */
+
+:root[data-theme='rose'] {
+  color-scheme: light;
+
+  --bg-base: #f7f0f3;
+  --bg-layer-1: #ffffff;
+  --bg-layer-2: #fffdfd;
+  --bg-layer-3: #fdeef3;
+  --bg-overlay: #ffffff;
+  --bg-sidebar: #f6e9ef;
+  --bg-input: #ffffff;
+
+  --border-1: rgb(154 55 118 / 0.12);
+  --border-2: rgb(154 55 118 / 0.2);
+
+  --text-1: #3a1424;
+  --text-2: #8a4a63;
+  --text-3: #a86b82;
+
+  --primary: #e91e63;
+  --primary-hover: #f06292;
+  --on-primary: #ffffff;
+  --primary-dim: rgb(233 30 99 / 0.12);
+
+  --hover: rgb(233 30 99 / 0.1);
+  --active: rgb(233 30 99 / 0.18);
+
+  --success: #2e7d32;
+  --warn: #ed6c02;
+  --error: #d32f2f;
+
+  --scrollbar: #e5c7d4;
+  --scrollbar-hover: #c392ab;
+
+  --code-bg: #fdeef3;
+
+  /* diffuse-light background: bright orbs at full strength + a base coat
+     whose alpha IS the user's slider (--glow-opacity): 1 = solid theme
+     background, 0 = fully clear. Orbs are decorative and NOT dimmed by
+     the slider */
+  --glow:
+    radial-gradient(1000px 560px at 84% -6%, rgb(214 120 160 / 0.26), transparent 60%),
+    radial-gradient(780px 500px at 10% 110%, rgb(230 180 205 / 0.18), transparent 58%),
+    radial-gradient(340px 260px at 18% 22%, rgb(255 255 255 / 0.65), transparent 70%),
+    radial-gradient(280px 220px at 72% 68%, rgb(236 170 200 / 0.4), transparent 72%),
+    radial-gradient(220px 180px at 45% 82%, rgb(255 236 246 / 0.55), transparent 70%),
+    linear-gradient(170deg, rgb(248 244 246 / var(--glow-opacity, 0.65)) 0%, rgb(244 238 242 / var(--glow-opacity, 0.65)) 55%, rgb(247 242 245 / var(--glow-opacity, 0.65)) 100%);
+
+  /* glass fills: TINTED bases (NOT neutral white) + a user-tunable alpha.
+     --glass-* are "R G B" triplets so .glass can compose
+     rgb(var(--glass-card) / var(--glass-alpha)) */
+  --glass-card: 255 253 253;
+  --glass-input: 255 255 255;
+  --glass-nav: 246 233 239;
+  --glass-rim: rgb(154 55 118 / 0.18);
+  --glass-rim-bright: rgb(255 255 255 / 0.95);
+  --glass-blur-strong: 22px;
+  --glass-blur-light: 10px;
+}
+
+/* ----------------------------- ember (dark) ----------------------------- */
+
+:root[data-theme='ember'] {
+  color-scheme: dark;
+
+  --bg-base: #16110d;
+  --bg-layer-1: #211a15;
+  --bg-layer-2: rgb(36 28 20 / 0.85);
+  --bg-layer-3: #231b15;
+  --bg-overlay: rgb(28 20 15 / 0.86);
+  --bg-sidebar: rgb(22 17 13 / 0.92);
+  --bg-input: rgb(255 255 255 / 0.08);
+
+  --border-1: rgb(253 186 116 / 0.1);
+  --border-2: rgb(253 186 116 / 0.18);
+
+  --text-1: #fdf0e6;
+  --text-2: #d0a98a;
+  --text-3: #a48266;
+
+  --primary: #f59e5b;
+  --primary-hover: #f8b06f;
+  --on-primary: #1f0f06;
+  --primary-dim: rgb(245 158 91 / 0.14);
+
+  --hover: rgb(245 158 91 / 0.14);
+  --active: rgb(245 158 91 / 0.22);
+
+  --success: #81c784;
+  --warn: #ffb74d;
+  --error: #e57373;
+
+  --scrollbar: rgb(255 255 255 / 0.085);
+  --scrollbar-hover: rgb(255 255 255 / 0.2);
+
+  --code-bg: rgb(0 0 0 / 0.32);
+
+  --glow:
+    radial-gradient(1100px 620px at 84% -8%, rgb(245 158 91 / 0.28), transparent 60%),
+    radial-gradient(820px 520px at 8% 110%, rgb(200 96 40 / 0.14), transparent 55%),
+    radial-gradient(360px 280px at 22% 18%, rgb(245 158 91 / 0.13), transparent 70%),
+    radial-gradient(300px 240px at 70% 72%, rgb(200 120 60 / 0.11), transparent 72%),
+    radial-gradient(240px 200px at 48% 86%, rgb(245 158 91 / 0.09), transparent 70%),
+    linear-gradient(165deg, rgb(28 23 18 / var(--glow-opacity, 0.65)) 0%, rgb(22 18 16 / var(--glow-opacity, 0.65)) 55%, rgb(25 19 16 / var(--glow-opacity, 0.65)) 100%);
+
+  --glass-card: 33 26 21;
+  --glass-input: 255 255 255;
+  --glass-nav: 22 17 13;
+  --glass-rim: rgb(253 186 116 / 0.22);
+  --glass-rim-bright: rgb(255 226 190 / 0.4);
+  --glass-blur-strong: 22px;
+  --glass-blur-light: 10px;
+}
+
+/* user-tunable glass opacity (slider in settings; default 25% fill) */
+:root {
+  --glass-alpha: 0.25;
+  --glass-alpha-input: 0.4;
+  --glass-alpha-nav: 0.35;
+  /* base-coat opacity: 65% reproduces the tuned wash; 1 = solid, 0 = clear */
+  --glow-opacity: 0.65;
+}
+
+/* --------------------------- material: frosted --------------------------- */
+
+:root[data-material='frosted'] {
+  --glass-blur: var(--glass-blur-strong);
+  --glass-sat: 1;
+}
+
+:root[data-material='liquid'] {
+  --glass-blur: var(--glass-blur-light);
+  --glass-sat: 1.6;
+}

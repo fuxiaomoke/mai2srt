@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mai2srt</title>
+    <script>
+      // Resolve the card's palette BEFORE anything paints, by the SAME rule
+      // the shell uses (systemLightAt in src/lib/appearance.tsx): a PINNED
+      // theme wins outright, and "follow system" is the clock -- dark from
+      // 19:00 until 07:00. Getting this wrong shows the wrong palette for as
+      // long as the card is up, and then the app window flips on handover.
+      // Deliberately no OS query here: the clock needs neither Rust nor the
+      // sidecar, which is exactly what this card exists to wait for.
+      (function () {
+        var root = document.documentElement;
+        function paint(light) { root.dataset.theme = light ? 'light' : 'dark'; }
+
+        var mode = null;
+        try {
+          mode = JSON.parse(localStorage.getItem('mai2srt.appearance') || '{}').mode;
+        } catch (e) { /* unreadable storage: treat as follow-system */ }
+        if (mode === 'rose' || mode === 'ember') {
+          paint(mode === 'rose');          // the user pinned light / dark
+          return;
+        }
+
+        var h = new Date().getHours();
+        paint(h >= 7 && h < 19);
+      })();
+    </script>
+    <style>
+      /* The boot card. Its window is transparent, frameless and
+         skipTaskbar (tauri.conf.json): the user sees THIS while the
+         sidecar boots instead of a taskbar button sitting there with
+         nothing behind it. main.tsx signals Rust (app_ready) once the
+         shell has painted and the startup prefetch settled; Rust then
+         closes this window and shows the real one, so the taskbar button
+         and the window are born together. */
+      /* This page is standalone (it never loads index.css), so the app's
+         UI font has to be declared here too -- otherwise the card falls
+         back to Yu Gothic UI / Microsoft YaHei while the window right
+         behind it uses CustomUI, and the handover shows the swap. */
+      @font-face {
+        font-family: 'CustomUI';
+        src: url('/fonts/CustomUI-Regular.ttf') format('truetype');
+        font-weight: 400 700;
+        font-style: normal;
+        font-display: swap;
+      }
+      html, body {
+        height: 100%; margin: 0; overflow: hidden;
+        background: transparent; user-select: none; -webkit-user-select: none;
+      }
+      body {
+        display: grid; place-items: center;
+        /* same stack as --font-ui in design/tokens.css */
+        font-family: 'CustomUI', 'Yu Gothic UI', 'Microsoft YaHei', system-ui, sans-serif;
+      }
+      .card {
+        /* Fills the window exactly. The window is transparent, so any
+           margin here exposes a strip of desktop -- and a CSS drop shadow
+           wider than that strip gets hard-cut at the window edge, which
+           reads as a feathered halo around the card. The rounded corners
+           are the only thing that should show the desktop. */
+        box-sizing: border-box;
+        width: 100%; height: 100%;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 12px; border-radius: 16px;
+        /* Tinted with the theme's own accent, over its card surface. Values
+           are copied from design/tokens.css because this page never loads
+           it: rose --primary #e91e63, ember --primary #f59e5b. A neutral
+           near-white / near-black card read as "the app has no colour yet"
+           for as long as it was up. */
+        background:
+          linear-gradient(160deg, rgb(233 30 99 / 0.10), rgb(233 30 99 / 0.20)),
+          rgb(255 253 253 / 0.96);
+        border: 1px solid rgb(154 55 118 / 0.3);
+        color: #8a4a63;
+      }
+      html[data-theme='dark'] .card {
+        background:
+          linear-gradient(160deg, rgb(245 158 91 / 0.10), rgb(245 158 91 / 0.22)),
+          rgb(33 26 21 / 0.96);
+        border-color: rgb(253 186 116 / 0.32);
+        color: #d0a98a;
+      }
+      img { width: 72px; height: 72px; }
+      .title { font-size: 13.5px; font-weight: 600; letter-spacing: 0.03em; }
+      .hint { font-size: 11.5px; opacity: 0.8; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <img src="/app-icon.png" alt="" />
+      <div class="title">mai2srt</div>
+      <div class="hint" id="hint"></div>
+    </div>
+    <script>
+      (function () {
+        // mirror the app's language choice (i18n.tsx: localStorage, zh default)
+        var en = (localStorage.getItem('mai2srt.lang') || 'zh') === 'en';
+        var hint = document.getElementById('hint');
+        hint.textContent = en ? 'Starting...' : '启动中…';
+        // Escalate only when the wait is real, and say the right thing: a
+        // genuinely FIRST launch pays for the sidecar behind an antivirus
+        // scan of the freshly installed files, while a later slow start
+        // (unbundled modules under `tauri dev`, a busy disk) is just slow.
+        // main.tsx sets the marker once an install has completed a boot --
+        // this is a fact about the install, never a stopwatch.
+        var first = localStorage.getItem('mai2srt.booted') !== '1';
+        setTimeout(function () {
+          if (first) {
+            hint.textContent = en ? 'First launch is initialising, please wait...'
+                                  : '首次启动正在初始化，请稍候…';
+          } else {
+            hint.textContent = en ? 'Still starting, waiting for the local service...'
+                                  : '仍在启动，正在等待本地服务…';
+          }
+        }, 6000);
+      })();
+    </script>
+  </body>
+</html>

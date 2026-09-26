@@ -1,0 +1,74 @@
+name: release
+
+# Tag-driven: push `v0.2.0` (after scripts/bump.ps1 0.2.0) and the release
+# builds + publishes itself. The tag MUST equal the repo version, or the
+# build fails before any artifact is produced.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches repo version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $conf = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne $conf) { throw "tag $tag != tauri.conf.json version $conf (run scripts/bump.ps1 $tag)" }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Python deps + PyInstaller
+        # [dev] brings pytest, which the sanity step below runs. The runner's
+        # preinstalled packages are not something to rely on.
+        run: pip install -e ".[dev]" pyinstaller
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # Must be explicit: this action reads packageManager from the
+          # package.json at the repository ROOT, and this repo's lives in
+          # app/ -- without a version it fails before anything else runs
+          # ("No pnpm version is specified"). Keep it on the same major as
+          # the pnpm that writes app/pnpm-lock.yaml.
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Frontend deps
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Backend deps sanity (tests)
+        run: python -m pytest tests -q
+
+      - name: Release build (ffmpeg + sidecar + NSIS)
+        shell: pwsh
+        run: scripts/release.ps1
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: mai2srt ${{ github.ref_name }}
+          # A hand-written, bilingual body for this version, prepended to
+          # GitHub's generated commit list. Missing file = generated notes
+          # alone (the action falls back quietly), so this never blocks a
+          # release; keep the file next to the code it describes.
+          body_path: docs/release-notes/${{ github.ref_name }}.md
+          files: |
+            dist/*-setup.exe
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

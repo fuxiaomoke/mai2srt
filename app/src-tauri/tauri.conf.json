@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "mai2srt",
+  "version": "0.1.0",
+  "identifier": "app.mai2srt.desktop",
+  "build": {
+    "beforeDevCommand": "node dev.mjs",
+    "devUrl": "http://localhost:5183",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "mai2srt",
+        "width": 1160,
+        "height": 760,
+        "minWidth": 920,
+        "minHeight": 620,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "center": true,
+        "visible": false
+      },
+      {
+        "label": "splash",
+        "url": "splash.html",
+        "title": "mai2srt",
+        "width": 300,
+        "height": 190,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "center": true,
+        "skipTaskbar": true,
+        "alwaysOnTop": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": ["backend/mai2srt-backend"],
+    "resources": {
+      "backend/_internal": "_internal/",
+      "backend/ffmpeg": "ffmpeg/",
+      "backend/licenses": "licenses/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false,
+        "installerHooks": "./nsis/hooks.nsh"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

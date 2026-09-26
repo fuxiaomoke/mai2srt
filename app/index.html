@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>app</title>
+    <style>
+      /* Boot plug. The Tauri window is transparent (the glass design lets
+         the desktop through) and is created HIDDEN (tauri.conf.json
+         `visible: false`), then shown by main.tsx once the shell has
+         painted. Nothing else can be on screen before that first frame,
+         so this plug IS the first frame: an opaque, correctly rounded
+         rectangle in the active theme's base color. `:empty` stops
+         matching the instant React renders into #root, so the plug
+         removes itself with no cleanup code. Colors are --bg-base from
+         design/tokens.css (rose / ember). */
+      #root:empty { background: #f7f0f3; }
+      /* the boot script below always sets data-boot, so these two rules are
+         what actually paints; the base color above is the no-script floor */
+      html[data-boot='light'] #root:empty { background: #f7f0f3 !important; }
+      html[data-boot='dark'] #root:empty { background: #16110d !important; }
+    </style>
+    <script>
+      // The plug's palette follows the SAME rule the shell does
+      // (systemLightAt in src/lib/appearance.tsx): a pinned mode wins, and
+      // "follow system" is the clock -- dark from 19:00 until 07:00. There is
+      // deliberately no prefers-color-scheme fallback: WebView2 reports the
+      // Windows apps flag there, which on a Custom preset (light apps, dark
+      // chrome) disagrees with the clock and would flash the other theme for
+      // the whole boot.
+      (function () {
+        var light;
+        try {
+          var mode = JSON.parse(localStorage.getItem('mai2srt.appearance') || '{}').mode;
+          if (mode === 'rose') light = true;
+          else if (mode === 'ember') light = false;
+        } catch (e) { /* unreadable storage: treat as follow-system */ }
+        if (light === undefined) {
+          var h = new Date().getHours();
+          light = h >= 7 && h < 19;
+        }
+        document.documentElement.dataset.boot = light ? 'light' : 'dark';
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

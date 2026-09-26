@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mai2srt"
+version = "0.1.0"
+description = "playground.microsoft.ai MAI-Transcribe-2 -> word-timestamp JSON -> SRT"
+requires-python = ">=3.10"
+# classic table form: PEP 639's SPDX-string form needs setuptools>=77
+license = {text = "GPL-3.0-only"}
+dependencies = ["playwright>=1.40", "fastapi>=0.110", "uvicorn>=0.29"]
+
+[project.optional-dependencies]
+# fastapi's TestClient needs an HTTP client, and which one moved under us:
+# starlette <= 0.4x imports httpx, newer releases import httpx2 (the
+# continuation now stewarded by Pydantic). Both are declared because they are
+# separate distributions that coexist: an older pinned environment keeps
+# working, and a fresh one (CI resolves the newest fastapi) gets what its
+# starlette asks for. Relying on httpx being installed by accident is how the
+# first release tag failed at test collection.
+dev = ["pytest>=8", "httpx>=0.27", "httpx2>=2"]
+
+[project.scripts]
+mai2srt = "mai2srt.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fuxiaomoke/mai2srt"
+Repository = "https://github.com/fuxiaomoke/mai2srt"
+Releases = "https://github.com/fuxiaomoke/mai2srt/releases"
+
+[tool.setuptools.packages.find]
+where = ["src"]
