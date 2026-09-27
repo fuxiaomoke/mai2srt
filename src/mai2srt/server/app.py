@@ -249,6 +249,19 @@ def create_app(cfg: Config) -> FastAPI:
             raise HTTPException(400, str(e)) from e
         return {"ok": True, "channel": body.channel}
 
+    @app.get("/api/preflight")
+    def preflight(kind: str = "run", use_llm: bool = True) -> dict:
+        """What this job is missing before it may start (see preflight.py).
+
+        Static and instant: the page asks on click and refuses to launch a job
+        that cannot work, naming the gap instead of failing a minute later.
+        """
+        from ..preflight import KIND_PROCESS, KIND_RUN, missing_requirements
+        if kind not in (KIND_RUN, KIND_PROCESS):
+            raise HTTPException(400, "unknown kind: %s" % kind)
+        missing = missing_requirements(cfg, kind=kind, use_llm=use_llm)
+        return {"ok": not missing, "missing": missing}
+
     # -------------------------------------------------------------- session
 
     @app.get("/api/session")
@@ -764,7 +777,8 @@ def create_app(cfg: Config) -> FastAPI:
                         "line": "音频提取预热失败（不影响转录）：%s" % e})
             asyncio.create_task(_prewarm())
         return {"srt_path": str(res.srt_path), "json_path": str(res.json_path),
-                "words": res.words, "entries": res.entries, "dialogue": res.dialogue}
+                "words": res.words, "entries": res.entries, "dialogue": res.dialogue,
+                "llm_note": res.llm_note}
 
     async def _process_job(cfg: Config, job: Job, body: RunIn) -> dict:
         # load + segment + LLM calls are all blocking: run the whole body off
@@ -783,11 +797,13 @@ def create_app(cfg: Config) -> FastAPI:
         # resolves, else next to the json (json stem, .mai stripped)
         out = storage.srt_target(cfg, src, t.source)
         sp, pp = _effective_params(body.params)
-        entries, _llm_note = build_entries(
+        entries, llm_note = build_entries(
             cfg, t, t.duration_s, segment_params=sp, post_params=pp,
             use_llm=body.use_llm,
             on_stage=lambda s, det: manager.emit(job, "stage", {"stage": s, "detail": det}),
             on_log=lambda m: manager.emit(job, "log", {"line": m}))
+        if llm_note:
+            manager.emit(job, "log", {"line": "大模型断句未完全生效：%s" % llm_note})
         d = sum(1 for e in entries if e.is_dialogue)
         try:
             out.write_text(to_srt(entries), encoding="utf-8")
@@ -806,7 +822,8 @@ def create_app(cfg: Config) -> FastAPI:
             stale = _edit_path(src)
             if stale.exists():
                 stale.unlink()
-        return {"srt_path": str(out), "entries": len(entries), "dialogue": d}
+        return {"srt_path": str(out), "entries": len(entries), "dialogue": d,
+                "llm_note": llm_note}
 
     @app.post("/api/preview")
     def preview(body: PreviewIn) -> dict:

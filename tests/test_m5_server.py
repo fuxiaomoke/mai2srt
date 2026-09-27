@@ -16,18 +16,52 @@ from mai2srt.server.jobs import BusyError, JobManager
 def test_tag_model_reasoning_and_context():
     m = llm_admin.tag_model("deepseek-v4-flash")
     assert m["reasoning"] is True
-    assert m["context_window"] == 128_000        # built-in table
+    assert m["context_window"] == 1_048_576      # built-in table (verified)
+    assert m["max_output"] == 393_216
+    assert m["limits_source"] == "builtin"       # a table guess, not the API
     assert m["efforts"] == list(llm_admin.EFFORT_LEVELS)
 
     m2 = llm_admin.tag_model("deepseek-chat")
     assert m2["reasoning"] is False or m2["reasoning"] is True  # name heuristic may hit
     m3 = llm_admin.tag_model("whisper-large")
     assert m3["reasoning"] is False
+    assert m3["context_window"] is None and m3["limits_source"] is None
 
 
 def test_tag_model_api_fields_win():
     m = llm_admin.tag_model("deepseek-v4-pro", {"context_length": 1_000_000})
     assert m["context_window"] == 1_000_000       # API beats built-in table
+    assert m["limits_source"] == "api"
+
+
+def test_tag_model_reads_declared_modalities_and_efforts():
+    """Providers STATE these; the name regexes only guess. Payload below is the
+    real deepseek-flash /v1/models entry."""
+    real = {
+        "id": "deepseek-flash",
+        "context_window": 1_048_576,
+        "max_output_tokens": 393_216,
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "effort": {"supported_levels": ["low", "high", "max"],
+                   "default_level": "high"},
+    }
+    m = llm_admin.tag_model("deepseek-flash", real)
+    assert m["vision"] is True                      # the regex alone says False
+    assert m["efforts"] == ["low", "high", "max"]   # not the 5-level guess
+    assert m["reasoning"] is True
+    assert m["limits_source"] == "api"
+
+    # ... and a declared text-only model stays text-only even when its name
+    # matches a vision pattern
+    t = llm_admin.tag_model("gemini-3.8-flash", {"input_modalities": ["text"]})
+    assert t["vision"] is False
+
+    # a declared "off" alone does not imply a thinking model
+    o = llm_admin.tag_model("plain-model", {
+        "effort": {"supported_levels": ["off"]}, "max_output_tokens": 4096})
+    assert o["efforts"] == ["off"]
+    assert o["reasoning"] is False
 
 
 def test_diff_models():

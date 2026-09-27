@@ -9,14 +9,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mai2srt.config import LLMConfig
+from mai2srt.segment.candidates import Candidate
 from mai2srt.segment.llm import (
     LLMEndpoint,
     ProtocolSplitter,
     OpenAICompatibleSplitter,
+    SplitTask,
     _build_request,
     resolve_endpoint,
 )
-from mai2srt.segment.rules import SegmentParams
+from mai2srt.segment.rules import SegmentParams, join_words
 from mai2srt.transcribe.parser import Word
 
 
@@ -127,6 +129,91 @@ def test_context_budget_clamp():
     assert small.budget_chars() == max(2_000, int(8_000 * 0.4 / 0.6))
     assert big.budget_chars() == 40_000
     assert none_meta.budget_chars() == 40_000
+
+
+def test_output_budget_clamps_batching():
+    """The reply is the batch's text re-emitted, so the generation ceiling
+    binds as hard as the context window does."""
+    # declared 8K output -> 4096-token budget -> ~6.8K chars, ~102 tasks
+    small = LLMEndpoint(max_output=8_192)
+    assert small.output_budget_tokens() == 4_096
+    assert small.budget_chars() == int(4_096 / 0.6)
+    assert small.budget_tasks() == 4_096 // 40
+    # unknown metadata: the smallest published vendor ceiling (64K) applies,
+    # so the 40K blast-radius cap is what actually binds
+    unknown = LLMEndpoint()
+    assert unknown.output_budget_tokens() == 32_000
+    assert unknown.budget_chars() == 40_000
+    assert unknown.budget_tasks() == 800
+    # a huge declared output cannot lift the blast-radius cap either
+    assert LLMEndpoint(max_output=524_288).budget_chars() == 40_000
+    # context window still wins when it is the smaller of the two
+    assert LLMEndpoint(context_window=8_000, max_output=524_288
+                       ).budget_chars() == int(8_000 * 0.4 / 0.6)
+
+
+def test_batching_is_char_bound_not_task_count():
+    e = LLMEndpoint()                       # 40_000 chars, 800 tasks
+    sp = ProtocolSplitter(e)
+
+    def task(rid, n):
+        words = [Word("あ", i * 0.2, i * 0.2 + 0.15) for i in range(n)]
+        return SplitTask(rid, words, [Candidate(0, "punct_comma")])
+
+    big = [task(i, 62) for i in range(300)]          # 18_600 chars in total
+    assert len(sp._batches(big)) == 1                # used to be 15 at 20/request
+    # ... while the scaffolding budget still guards thousands of tiny runs
+    tiny = [task(i, 20) for i in range(1_000)]       # 20_000 chars, 1_000 ids
+    batches = sp._batches(tiny)
+    assert len(batches) == 2
+    assert all(len(b) <= e.budget_tasks() for b in batches)
+
+
+def test_packing_never_exceeds_the_generation_budget():
+    """Every batch's ESTIMATED reply (text + per-task JSON scaffolding) must
+    fit the generation budget -- a char-only rule silently over-packs hundreds
+    of short runs, whose wrappers are then the bulk of the reply."""
+    import mai2srt.segment.llm as llm
+    for meta in (LLMEndpoint(max_output=8_192), LLMEndpoint(max_output=64_000),
+                 LLMEndpoint()):
+        sp = ProtocolSplitter(meta)
+        for n in (20, 62):
+            tasks = [SplitTask(rid, [Word("あ", i * 0.2, i * 0.2 + 0.15)
+                                     for i in range(n)],
+                               [Candidate(0, "punct_comma")])
+                     for rid in range(700)]
+            batches = sp._batches(tasks)
+            assert len(batches) > 1                 # 43_400 chars: split up
+            for b in batches:
+                chars = sum(len(join_words(t.words)) for t in b)
+                cost = int(chars * llm._CHARS_PER_TOKEN) \
+                    + len(b) * llm._TASK_OVERHEAD_TOKENS
+                assert cost <= meta.output_budget_tokens(), (n, len(b), cost)
+
+
+def test_build_request_carries_output_cap_per_protocol():
+    # each vendor names the field differently, and xAI/MiniMax deprecated
+    # OpenAI's max_tokens in favour of max_completion_tokens
+    o = LLMEndpoint(protocol="openai", base_url="https://api.deepseek.com",
+                    api_key="k", model="m")
+    _u, payload, _h = _build_request(o, "S", "U", 30_000)
+    assert payload["max_completion_tokens"] == 30_000
+    _u, payload, _h = _build_request(o, "S", "U")          # None: untouched
+    assert "max_completion_tokens" not in payload
+
+    a = LLMEndpoint(protocol="anthropic", base_url="https://a.example",
+                    api_key="k", model="m", max_output=128_000)
+    _u, payload, _h = _build_request(a, "S", "U", 30_000)
+    assert payload["max_tokens"] == 30_000                 # the batch need wins
+    _u, payload, _h = _build_request(a, "S", "U")
+    assert payload["max_tokens"] == 128_000                # else the model meta
+
+    g = LLMEndpoint(protocol="gemini", base_url="https://g.example",
+                    api_key="k", model="m")
+    _u, payload, _h = _build_request(g, "S", "U", 30_000)
+    assert payload["generationConfig"]["maxOutputTokens"] == 30_000
+    _u, payload, _h = _build_request(g, "S", "U")
+    assert "maxOutputTokens" not in payload["generationConfig"]
 
 
 def test_batching_respects_budget():

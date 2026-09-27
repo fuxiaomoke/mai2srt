@@ -103,6 +103,19 @@ def segment_transcript(
             if llm_status is not None:
                 llm_status.append(str(e))
             chosen = {}
+        else:
+            # A run the splitter did not answer for (its lines failed to align,
+            # or its whole batch died) silently falls back below. That is a
+            # QUALITY loss, not a crash, so it must still reach the user rather
+            # than only the log stream: same llm_status channel as a failure.
+            missing = [t.run_id for t in tasks if t.run_id not in chosen]
+            if missing:
+                emit("LLM split: %d/%d over-limit runs degraded to the "
+                     "deterministic split" % (len(missing), len(tasks)))
+                if llm_status is not None:
+                    llm_status.append(
+                        "大模型断句有 %d/%d 段未能对齐，已退回规则切分"
+                        % (len(missing), len(tasks)))
 
     for task in tasks:
         picked = chosen.get(task.run_id)

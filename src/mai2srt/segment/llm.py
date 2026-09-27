@@ -22,6 +22,13 @@ M6e note: the deterministic sentence-completion pass was ACTIVATED briefly
 and is now HELD INACTIVE in pipeline.py -- punctuation is not a trustworthy
 semantic signal across languages (a transcription comma may BE a sentence
 end); revisit only as a per-language fallback.
+
+Batching note: batches are packed by CHAR budget bounded by BOTH model
+ceilings -- the context window (prompt side) and the generation budget (reply
+side, from the model's declared max output with a conservative fallback), not
+by a fixed task count. A batch big enough to outgrow a platform default also
+carries an EXPLICIT generation cap; an endpoint that refuses that field is
+remembered, and the batches shrink to a known-safe ceiling instead of failing.
 """
 from __future__ import annotations
 
@@ -39,9 +46,35 @@ from ..transcribe.parser import Word
 from .candidates import Candidate
 from .rules import SegmentParams, _needs_space, join_words
 
-#: batch guards -- M2 defaults, now clamped by the active model's context
-_MAX_TASKS_PER_REQUEST = 20
+#: batch guards -- the char ceiling is the blast-radius cap (one request that
+#: drifts loses every run inside it), the rest is derived from the model.
 _MAX_MARKED_CHARS_PER_REQUEST = 40_000
+
+#: generation ceiling assumed when the endpoint's model metadata is unknown:
+#: the SMALLEST published max-output among the current flagships and fast
+#: tiers (Claude Haiku 4.5 = 64K; Gemini 3.8 Flash = 65,536; everything else
+#: 128K-524K). Batching by the minimum keeps every vendor inside its budget.
+_DEFAULT_MAX_OUTPUT_TOKENS = 64_000
+
+#: share of that ceiling a batch may spend: thinking models bill their
+#: chain-of-thought against the SAME generation budget (DeepSeek V4.1 thinks by
+#: default, grok/GLM/Kimi/MiniMax cannot fully switch it off) and the reply
+#: carries JSON scaffolding on top of the re-emitted text.
+_OUTPUT_SAFETY = 0.5
+
+#: JSON scaffolding charged per [id=N] task (braces, quotes, id, line breaks)
+_TASK_OVERHEAD_TOKENS = 40
+
+#: expected-output inflation over the raw text (quotes, ids, line breaks)
+_JSON_OVERHEAD = 1.25
+
+#: an explicit generation cap is only worth the field-name zoo once a batch
+#: could actually outgrow a platform default; below this nothing is sent
+_OUTPUT_CAP_FLOOR_TOKENS = 4_000
+
+#: ceiling assumed after an endpoint REFUSES that field: the smallest platform
+#: default documented by the vendors (DeepSeek, non-thinking mode = 8K)
+_ASSUMED_DEFAULT_OUTPUT_TOKENS = 8_000
 
 #: M6d: fixed target-range floor (user decision -- trans-jimaku-web's 10~50)
 _TARGET_MIN_CHARS = 10
@@ -54,7 +87,14 @@ _NON_RETRYABLE_HTTP = (400, 401, 403, 404)
 _RETRYABLE_KEYWORDS = ("timeout", "timed out", "connect", "connection",
                        "network", "超时", "网络", "reply", "json", "mismatch")
 
-#: conservative chars-per-token estimate for CJK-heavy subtitle text
+#: field names an endpoint may name when it refuses our generation cap
+_CAP_FIELD_RE = re.compile(
+    r"max_completion_tokens|max_tokens|max_output_tokens|maxOutputTokens|"
+    r"maximum.?tokens", re.I)
+
+#: conservative token estimate for CJK-heavy subtitle text. The NAME is
+#: historical: every formula in this module treats it as TOKENS PER CHAR
+#: (``tokens = chars * _CHARS_PER_TOKEN``), i.e. 1 token ~ 1.67 characters.
 _CHARS_PER_TOKEN = 0.6
 
 
@@ -82,13 +122,41 @@ class LLMEndpoint:
                    model=cfg.model, temperature=cfg.temperature,
                    timeout_s=cfg.timeout_s)
 
-    def budget_chars(self) -> int:
-        """Marked-text char budget per request, clamped by context window."""
+    def output_budget_tokens(self) -> int:
+        """Generation tokens one batch may ask the model to produce."""
+        declared = self.max_output or _DEFAULT_MAX_OUTPUT_TOKENS
+        return int(declared * _OUTPUT_SAFETY)
+
+    def input_budget_chars(self) -> int:
+        """Char budget for a PROMPT: the context window, and the blast radius.
+
+        Only the input side -- used where the reply is not the batch's text
+        (the whole-job summary call).
+        """
         budget = _MAX_MARKED_CHARS_PER_REQUEST
         if self.context_window and self.context_window > 0:
             adaptive = int(self.context_window * 0.4 / _CHARS_PER_TOKEN)
             budget = min(budget, max(2_000, adaptive))
         return budget
+
+    def budget_chars(self) -> int:
+        """Char budget per request, clamped by BOTH model ceilings.
+
+        The prompt side is bounded by the context window; the reply side is the
+        same text re-emitted as JSON, so the generation ceiling binds too --
+        whichever is smaller wins.
+        """
+        out_chars = int(self.output_budget_tokens() / _CHARS_PER_TOKEN)
+        return min(self.input_budget_chars(), max(2_000, out_chars))
+
+    def budget_tasks(self) -> int:
+        """How many [id=N] blocks fit the output budget's scaffolding alone.
+
+        Bounds the pathological packing (thousands of tiny runs) that the char
+        budget cannot see: each block costs its JSON wrapper even when its text
+        is short.
+        """
+        return max(1, self.output_budget_tokens() // _TASK_OVERHEAD_TOKENS)
 
     def effort_kwargs(self) -> dict:
         """Protocol-native reasoning effort; empty when off/unsupported."""
@@ -178,6 +246,17 @@ def _is_retryable_error(err: str) -> bool:
         return code in _RETRYABLE_HTTP
     low = (err or "").lower()
     return any(k in low for k in _RETRYABLE_KEYWORDS)
+
+
+def _is_output_cap_rejection(err: str) -> bool:
+    """True when a 4xx names our generation-cap field (unsupported parameter).
+
+    Kept narrow on purpose: only a 4xx that explicitly mentions one of the
+    field names counts, so a generic 400 still fails fast as before.
+    """
+    if not re.search(r"HTTP 4\d\d", err or ""):
+        return False
+    return bool(_CAP_FIELD_RE.search(err or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +379,15 @@ def _content(reply: dict, protocol: str) -> str:
 # request building (three protocols)
 # ---------------------------------------------------------------------------
 
-def _build_request(endpoint: LLMEndpoint, system: str,
-                   user: str) -> tuple[str, dict, dict]:
-    """Pure request construction -> (url, payload, headers) per protocol."""
+def _build_request(endpoint: LLMEndpoint, system: str, user: str,
+                   output_tokens: int | None = None) -> tuple[str, dict, dict]:
+    """Pure request construction -> (url, payload, headers) per protocol.
+
+    ``output_tokens`` asks the endpoint for an explicit generation ceiling.
+    Field names differ per protocol (and xAI/MiniMax deprecated OpenAI's
+    ``max_tokens`` in favour of ``max_completion_tokens``), so it is mapped
+    here; ``None`` leaves the platform default alone.
+    """
     p = endpoint.protocol
     if p == "openai":
         base = endpoint.base_url.rstrip("/")
@@ -314,6 +399,8 @@ def _build_request(endpoint: LLMEndpoint, system: str,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
         }
+        if output_tokens:
+            payload["max_completion_tokens"] = output_tokens
         payload.update(endpoint.effort_kwargs())
         headers = {"Content-Type": "application/json",
                    "Authorization": "Bearer %s" % endpoint.api_key}
@@ -321,7 +408,7 @@ def _build_request(endpoint: LLMEndpoint, system: str,
         url = endpoint.base_url.rstrip("/") + "/v1/messages"
         payload = {
             "model": endpoint.model,
-            "max_tokens": endpoint.max_output or 8192,
+            "max_tokens": output_tokens or endpoint.max_output or 8192,
             "temperature": endpoint.temperature,
             "system": system,
             "messages": [{"role": "user", "content": user}],
@@ -341,6 +428,8 @@ def _build_request(endpoint: LLMEndpoint, system: str,
             endpoint.base_url.rstrip("/"), endpoint.model, endpoint.api_key)
         gen: dict = {"temperature": endpoint.temperature}
         gen.update(endpoint.effort_kwargs().get("generationConfig", {}))
+        if output_tokens:
+            gen["maxOutputTokens"] = output_tokens
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -355,9 +444,10 @@ def _build_request(endpoint: LLMEndpoint, system: str,
     return url, payload, headers
 
 
-def _request(endpoint: LLMEndpoint, system: str, user: str) -> str:
+def _request(endpoint: LLMEndpoint, system: str, user: str,
+             output_tokens: int | None = None) -> str:
     """Build + send one chat request in the endpoint's native protocol."""
-    url, payload, headers = _build_request(endpoint, system, user)
+    url, payload, headers = _build_request(endpoint, system, user, output_tokens)
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers=headers, method="POST")
@@ -386,6 +476,11 @@ class ProtocolSplitter:
                  log: Callable[[str], None] | None = None) -> None:
         self.e = endpoint
         self._log = log or (lambda m: None)
+        #: an explicit generation cap is sent for batches large enough to need
+        #: one; an endpoint that refuses the field turns this off and shrinks
+        #: the batches to a ceiling a platform default is known to cover
+        self._send_cap = True
+        self._cap_chars: int | None = None
 
     def choose(self, tasks: list[SplitTask],
                params: SegmentParams) -> dict[int, list[list[Word]]]:
@@ -397,7 +492,15 @@ class ProtocolSplitter:
         summary = self._get_summary(tasks)
         out: dict[int, list[int]] = {}
         errors: list[str] = []
-        for batch in self._batches(tasks):
+        batches = self._batches(tasks)
+        # a 300-run job can be several minutes of pure waiting: every batch
+        # reports before it is sent, so the UI log is never blank in between
+        self._log("断句：%d 段，分 %d 批发给 %s"
+                  % (len(tasks), len(batches), self.e.model or "?"))
+        for i, batch in enumerate(batches, 1):
+            self._log("断句批次 %d/%d：%d 段，约 %d 字"
+                      % (i, len(batches), len(batch),
+                         sum(len(join_words(t.words)) for t in batch)))
             out.update(self._run_batch(batch, params, summary, errors))
         if errors:
             self._log("%d split batch(es) degraded to fallback: %s"
@@ -405,16 +508,30 @@ class ProtocolSplitter:
         if not out:
             raise LLMSplitError("all split batches failed: %s"
                                 % "; ".join(errors)[:200])
+        self._log("断句完成：%d/%d 段由大模型给出" % (len(out), len(tasks)))
         return out
 
     # ---------------------------------------------------------------- context
 
     def _get_summary(self, tasks: list[SplitTask]) -> str:
         """One cheap summary call for cross-chunk context (M6d). Failure is
-        non-fatal: the split proceeds without it."""
+        non-fatal: the split proceeds without it.
+
+        The prompt side is the WHOLE job here (unlike the split calls, which
+        are batched), so a long recording can exceed the model's context
+        window. Trim to the input budget instead of letting the call fail:
+        head and tail are kept (scene-setting and closure), the middle drops.
+        """
         text = "\n".join(join_words(t.words) for t in tasks).strip()
         if not text:
             return ""
+        budget = self.e.input_budget_chars()
+        if len(text) > budget:
+            head = int(budget * 0.6)
+            tail = budget - head
+            self._log("摘要文本 %d 字超出输入预算 %d 字，只送首尾各一段"
+                      % (len(text), budget))
+            text = text[:head] + "\n...\n" + text[-tail:]
         self._log("生成全文摘要（断句上下文）...")
         try:
             content = _request(replace(self.e, temperature=0.5),
@@ -442,18 +559,50 @@ class ProtocolSplitter:
             return {}
 
     def _batches(self, tasks: list[SplitTask]) -> list[list[SplitTask]]:
-        limit = self.e.budget_chars()
-        batches, cur, size = [], [], 0
+        """Pack tasks by COST, not by a fixed task count.
+
+        Charged against the generation budget per task: its text tokens
+        (``_CHARS_PER_TOKEN``) PLUS its JSON scaffolding -- the char ceiling
+        alone cannot see hundreds of tiny runs whose wrappers are the bulk of
+        the reply. The input-side char budget (context window, blast radius)
+        binds independently.
+        """
+        char_limit = self.e.budget_chars()
+        if self._cap_chars is not None:
+            char_limit = min(char_limit, self._cap_chars)
+        token_limit = self.e.output_budget_tokens()
+        max_tasks = self.e.budget_tasks()
+        batches, cur, size, cost = [], [], 0, 0
         for t in tasks:
             n = len(join_words(t.words))
-            if cur and (len(cur) >= _MAX_TASKS_PER_REQUEST or size + n > limit):
+            # float accumulation on purpose: rounding each task down lets a
+            # full batch drift over the budget (one token per task)
+            step = n * _CHARS_PER_TOKEN + _TASK_OVERHEAD_TOKENS
+            if cur and (len(cur) >= max_tasks or size + n > char_limit
+                        or cost + step > token_limit):
                 batches.append(cur)
-                cur, size = [], 0
+                cur, size, cost = [], 0, 0
             cur.append(t)
             size += n
+            cost += step
         if cur:
             batches.append(cur)
         return batches
+
+    def _batch_cap(self, batch: list[SplitTask]) -> int | None:
+        """Explicit generation ceiling for this batch (None = leave it alone).
+
+        Only worth sending once the reply could outgrow a platform default;
+        clamped to what the model itself declares when the metadata is known.
+        """
+        if not self._send_cap:
+            return None
+        text = sum(len(join_words(t.words)) for t in batch)
+        need = int((text * _CHARS_PER_TOKEN
+                    + len(batch) * _TASK_OVERHEAD_TOKENS) * _JSON_OVERHEAD)
+        if need <= _OUTPUT_CAP_FLOOR_TOKENS:
+            return None
+        return min(self.e.max_output or _DEFAULT_MAX_OUTPUT_TOKENS, need)
 
     def _choose_batch(self, batch: list[SplitTask],
                       params: SegmentParams, summary: str) -> dict[int, list[list[Word]]]:
@@ -468,13 +617,15 @@ class ProtocolSplitter:
 
         system = _SYSTEM_PROMPT.format(min_chars=_TARGET_MIN_CHARS,
                                        max_chars=params.max_chars)
+        cap = self._batch_cap(batch)
         error_note = ""
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
                 # BOTH the request and the parse/align sit inside the retry
                 # loop: a retryable transport error must not escape early,
                 # and a malformed/misaligned reply gets a corrective note
-                content = _request(self.e, system + error_note, user)
+                content = _request(self.e, system + error_note, user,
+                                   output_tokens=cap)
                 out: dict[int, list[list[Word]]] = {}
                 for rid, lines in self._parse(content).items():
                     task = by_id.get(rid)
@@ -490,6 +641,19 @@ class ProtocolSplitter:
                 return out
             except LLMSplitError as e:
                 msg = str(e)
+                if cap is not None and _is_output_cap_rejection(msg):
+                    # the endpoint does not accept the field: drop it for the
+                    # rest of the job and shrink later batches to a ceiling a
+                    # platform default is known to cover. Immediate retry --
+                    # this is not a failure, just an unsupported parameter.
+                    self._send_cap = False
+                    self._cap_chars = max(
+                        2_000, int(_ASSUMED_DEFAULT_OUTPUT_TOKENS
+                                   * _OUTPUT_SAFETY / _CHARS_PER_TOKEN))
+                    cap = None
+                    self._log("端点不接受生成上限参数（%s），已改为不发送并"
+                              "把分批收紧到 %d 字" % (msg[:80], self._cap_chars))
+                    continue
                 if attempt >= _MAX_ATTEMPTS or not _is_retryable_error(msg):
                     raise
                 low = msg.lower()

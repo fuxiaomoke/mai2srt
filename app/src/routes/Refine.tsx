@@ -19,7 +19,8 @@ import {
   usePlayer,
 } from '../lib/player';
 import {
-  PARAM_SPECS, fmtEntryTime, glueText, isDialogueText, joinWords, wordsToText,
+  PARAM_SPECS, fmtEntryTime, glueText, isDialogueText, isPunctuation,
+  joinWords, sentenceSpans, wordsToText,
 } from '../lib/subtitle';
 
 /** a preview entry plus the "manually modified" marker */
@@ -103,6 +104,9 @@ export function RefinePage() {
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState('');
   const [splitIdx, setSplitIdx] = useState<number | null>(null);
+  // split granularity: sentence level first (the common case); character
+  // level exists for cutting inside a sentence, and highlights punctuation
+  const [splitLevel, setSplitLevel] = useState<'sentence' | 'char'>('sentence');
   // two-click delete: first click arms (red icon), second click removes
   const [delIdx, setDelIdx] = useState<number | null>(null);
   // playback audio binding for the current file (from /api/preview)
@@ -155,6 +159,14 @@ export function RefinePage() {
   // implicitly closing the editor would strand the draft. Scissors and
   // the delete arming carry no data, so they just close each other.
   const editOpen = editingIdx !== null;
+  // ONE inline tool at a time per screen: the text editor, the split panel or
+  // an armed delete. Its row index doubles as the "a tool is open" flag --
+  // while it is set, the actions that would collide are LOCKED rather than
+  // silently swallowing the tool state (merging from any row shifts the word
+  // indices an open draft or split panel is anchored to; playing a line while
+  // its draft is open put two live states on one row).
+  const toolRow = editingIdx ?? delIdx ?? splitIdx;
+  const toolOpen = toolRow !== null;
   // undo/redo carry the same locks as the row tools: busy (an in-flight
   // regen would land on the restored screen and overwrite it), playing
   // (restoring moves the word indices the playhead maps onto), editOpen
@@ -650,6 +662,52 @@ export function RefinePage() {
     }
     setEditingIdx(null);
   }
+
+  /** Exit whichever inline tool is open on a row OTHER than `keep`
+   *  (null = any row): the outside-click path, and what every tool icon runs
+   *  before it takes over. A pending text draft is COMMITTED, never dropped --
+   *  the undo stack only stores committed screens, so a discarded draft would
+   *  be unrecoverable. */
+  function closeTool(keep: number | null) {
+    if (editingIdx !== null && editingIdx !== keep) commitText(editingIdx);
+    if (splitIdx !== null && splitIdx !== keep) setSplitIdx(null);
+    if (delIdx !== null && delIdx !== keep) setDelIdx(null);
+  }
+
+  // Clicking anywhere OUTSIDE THE ROW THAT OWNS THE OPEN TOOL exits it --
+  // another row counts, wherever in it you click (its text, its header, its
+  // padding, one of its buttons: each of those either closes the tool itself
+  // or has nothing to do with it). Only the owning row is exempt, so clicking
+  // its own text/padding never interrupts what you are doing there.
+  //
+  // CAPTURE phase, and that is load-bearing: React flushes a discrete click
+  // synchronously, so by the time a BUBBLE-phase document listener runs, the
+  // row it just opened an editor in has re-rendered -- the clicked <p> has been
+  // replaced and detached, closest('[data-row]') finds nothing, and the guard
+  // fails. The listener then "closed" the editor the same click had opened.
+  // (Synthetic el.click() updates state later, so the node is still attached
+  // and the bug hides -- only real mouse input shows it.) Capture runs before
+  // React touches the DOM, where the target is still where it was clicked.
+  const closeToolRef = useRef(closeTool);
+  const toolRowRef = useRef<number | null>(toolRow);
+  const outsideClickRef = useRef<(row: number | null) => void>(() => {});
+  useEffect(() => {
+    closeToolRef.current = closeTool;
+    toolRowRef.current = toolRow;
+    outsideClickRef.current = (row) => {
+      if (toolRowRef.current === row) return;
+      closeToolRef.current(null);
+    };
+  });
+  useEffect(() => {
+    const onDocClick = (ev: MouseEvent) => {
+      const el = (ev.target as HTMLElement | null)?.closest?.('[data-row]');
+      const raw = el ? Number((el as HTMLElement).dataset.row) : NaN;
+      outsideClickRef.current(Number.isNaN(raw) ? null : raw);
+    };
+    document.addEventListener('click', onDocClick, true);
+    return () => document.removeEventListener('click', onDocClick);
+  }, []);
 
   /** dialogue + plain: the plain text glues INTO one of the dialogue's
    *  lines -- never across the dash format. Target line = the one whose
@@ -1206,6 +1264,7 @@ export function RefinePage() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
               title={over ? t('r.overLimit') : undefined}
+              data-row={i}
               onClick={(ev) => seekRow(i, ev)}
               className={`group relative mb-1.5 rounded-(--radius-s) border px-3.5 py-2.5 ${
                 over
@@ -1253,7 +1312,7 @@ export function RefinePage() {
                       stop affordance is reachable without hovering */}
                   <button
                     onClick={() => toggleListen(i)}
-                    disabled={!audioInfo?.resolved || editingIdx !== null || beyond}
+                    disabled={!audioInfo?.resolved || toolOpen || beyond}
                     className={`grid h-6 w-6 place-items-center rounded transition-opacity hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40 ${
                       rowPlaying ? 'text-primary' : 'text-ink-3 opacity-0 group-hover:opacity-100 hover:text-primary'
                     }`}
@@ -1270,11 +1329,10 @@ export function RefinePage() {
                   }`}>
                   <button
                     onClick={() => {
-                      // mutual exclusion with the split scissors: the
-                      // scissors align on the row's words, a pending text
-                      // edit would strand them -- one inline tool at a time
-                      setSplitIdx(null);
-                      setDelIdx(null);
+                      // one inline tool at a time: everything closes first
+                      // (a draft open on ANOTHER row is committed rather than
+                      // overwritten)
+                      closeTool(null);
                       setEditingIdx(i);
                       setEditDraft(e.text);
                     }}
@@ -1286,14 +1344,17 @@ export function RefinePage() {
                   </button>
                   <button
                     onClick={() => {
-                      // scissors carry no draft, so other tools just close
-                      // them; but they are unreachable while an editor
-                      // holds a draft (disabled below)
-                      setEditingIdx(null);
-                      setDelIdx(null);
+                      // scissors carry no draft, so other tools just close;
+                      // they stay unreachable while an editor holds one
+                      closeTool(i);
                       setSplitIdx(splitIdx === i ? null : i);
                     }}
-                    disabled={player.playing || editOpen}
+                    /* structural tools are mutually exclusive: while ANY tool
+                       is open only this row's own scissors (to close the panel)
+                       and the pencil (the one safe switcher) can be clicked.
+                       Hopping straight from an armed delete into a cut -- or
+                       back -- is how a pending decision gets lost. */
+                    disabled={player.playing || (toolOpen && splitIdx !== i)}
                     className={`grid h-6 w-6 place-items-center rounded hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40 ${
                       splitIdx === i ? 'text-primary' : 'text-ink-3 hover:text-primary'
                     }`}
@@ -1310,12 +1371,15 @@ export function RefinePage() {
                       if (delIdx === i) {
                         deleteEntry(i);
                       } else {
-                        setSplitIdx(null);   // arming closes the scissors
+                        closeTool(null);     // arming closes every other tool
                         setDelIdx(i);
                         teachTwoStep(t('r.del.hint'));
                       }
                     }}
-                    disabled={player.playing || editOpen}
+                    /* same mutual exclusion as the scissors: an armed delete
+                       cannot be reached from an open split panel (nor from an
+                       editor), only from a row with no tool open */
+                    disabled={player.playing || (toolOpen && delIdx !== i)}
                     /* hover lives inside each branch: a shared hover:bg-hover
                        would override the armed tint exactly when the pointer
                        is on the button, i.e. just before the confirm click */
@@ -1340,11 +1404,14 @@ export function RefinePage() {
                     </motion.span>
                   </button>
                   {/* merge: same icon family, orientation = direction
-                      (up = absorbed into previous, down = absorb next) */}
+                      (up = absorbed into previous, down = absorb next).
+                      Locked while ANY inline tool is open, not just an editor:
+                      a merge renumbers the entries an open draft or split panel
+                      is anchored to, so it must not run around them. */}
                   {i > 0 && (
                     <button
                       onClick={() => mergeWithNext(i - 1)}
-                      disabled={player.playing || editOpen}
+                      disabled={player.playing || toolOpen}
                       className="grid h-6 w-6 place-items-center rounded text-ink-3 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                       title={t('r.mergePrev')}
                     >
@@ -1354,7 +1421,7 @@ export function RefinePage() {
                   {i < entries.length - 1 && (
                     <button
                       onClick={() => mergeWithNext(i)}
-                      disabled={player.playing || editOpen}
+                      disabled={player.playing || toolOpen}
                       className="grid h-6 w-6 place-items-center rounded text-ink-3 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                       title={t('r.mergeNext')}
                     >
@@ -1378,13 +1445,17 @@ export function RefinePage() {
                     rows={Math.min(4, e.text.split('\n').length + 1)}
                     className="glass-input w-full resize-none px-3 py-2 text-[13px] leading-relaxed text-ink-1"
                   />
-                  <div className="flex gap-2">
+                  <div className="flex items-center gap-2">
                     <Button onClick={() => commitText(i)}>
                       <Check size={13} strokeWidth={2} /> {t('r.edit.ok')}
                     </Button>
                     <Button variant="ghost" onClick={() => setEditingIdx(null)}>
                       <X size={13} strokeWidth={2} /> {t('r.edit.cancel')}
                     </Button>
+                    {/* clicking away COMMITS (a draft that was never committed
+                        has no undo frame, so dropping it would be silent data
+                        loss) -- cancelling stays an explicit choice */}
+                    <span className="text-[10.5px] text-ink-3">{t('r.edit.hint')}</span>
                   </div>
                 </div>
               ) : (
@@ -1395,10 +1466,11 @@ export function RefinePage() {
                 <div
                   onClick={() => {
                     if (player.playing) return;
-                    // click-to-edit entry: same tool exclusion (scissors
-                    // close, delete arming disarms) before editing starts
-                    setSplitIdx(null);
-                    setDelIdx(null);
+                    // click-anywhere-in-the-text entry (the dashed affordance on
+                    // hover): it closes whatever tool is open first -- including
+                    // the split panel on THIS row -- and commits a draft from
+                    // another row instead of dropping it
+                    closeTool(null);
                     setEditingIdx(i);
                     setEditDraft(e.text);
                   }}
@@ -1417,30 +1489,93 @@ export function RefinePage() {
                 </div>
               )}
 
-              {/* split mode: word chips with clickable gaps */}
+              {/* split mode: TWO rows -- the granularity control, then the
+                  chips. Sentence level is the default because a cut inside a
+                  sentence is the rare case; character level highlights the
+                  punctuation, which is what makes a wanted gap findable among
+                  forty identical chips. */}
               {splitIdx === i && (
-                <div
-                  data-noseek
-                  className="mt-2 flex flex-wrap items-center gap-y-1.5 border-t border-line-1 pt-2"
-                >
-                  <span className="mr-1 text-[10.5px] text-ink-3">{t('r.split.hint')}</span>
-                  {words.slice(e.w0, e.w1 + 1).map((w, wi) => (
-                    <span key={wi} className="flex items-center">
-                      <span className="rounded bg-sunken px-1.5 py-0.5 text-[11.5px] text-ink-1">
-                        {w.text}
-                      </span>
-                      {wi < e.w1 - e.w0 && (
-                        <button
-                          onClick={() => splitAt(i, wi)}
-                          disabled={player.playing}
-                          className="mx-0.5 grid h-4 w-3 place-items-center rounded text-ink-3 transition-colors hover:bg-primary-dim hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
-                          title={t('r.split')}
-                        >
-                          <Scissors size={9} strokeWidth={2} />
-                        </button>
-                      )}
+                <div data-noseek className="mt-2 border-t border-line-1 pt-2">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    {(['sentence', 'char'] as const).map((lv) => (
+                      <button
+                        key={lv}
+                        onClick={() => setSplitLevel(lv)}
+                        className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors duration-(--dur-in) ${
+                          splitLevel === lv
+                            ? 'border-primary bg-primary-dim text-primary'
+                            : 'border-line-1 text-ink-2 hover:border-line-2'
+                        }`}
+                      >
+                        {t(lv === 'sentence' ? 'r.split.by.sentence' : 'r.split.by.char')}
+                      </button>
+                    ))}
+                    <span className="text-[10.5px] text-ink-3">
+                      {t(splitLevel === 'sentence' ? 'r.split.hint' : 'r.split.hint.char')}
                     </span>
-                  ))}
+                  </div>
+
+                  {splitLevel === 'sentence' ? (
+                    <div className="flex flex-wrap items-center gap-y-1.5">
+                      {(() => {
+                        const spans = sentenceSpans(words, e.w0, e.w1);
+                        return spans.map((sp, si) => (
+                          <span key={si} className="flex items-center">
+                            <span className="break-all rounded bg-sunken px-1.5 py-0.5 text-[11.5px] text-ink-1">
+                              {joinWords(words.slice(sp.s, sp.t + 1))}
+                            </span>
+                            {si < spans.length - 1 && (
+                              <button
+                                onClick={() => splitAt(i, sp.t - e.w0)}
+                                disabled={player.playing}
+                                className="mx-1 grid h-5 w-4 place-items-center rounded text-ink-2 transition-colors hover:bg-primary-dim hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                                title={t('r.split')}
+                              >
+                                <Scissors size={11} strokeWidth={2.2} />
+                              </button>
+                            )}
+                          </span>
+                        ));
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-y-1.5">
+                      {words.slice(e.w0, e.w1 + 1).map((w, wi) => (
+                        <span key={wi} className="flex items-center">
+                          {/* Every punctuation mark gets the SAME treatment: one
+                              uniform rule ("punctuation = solid accent chip") is
+                              scannable, whereas the splitter's internal cut
+                              priority (final > comma > pause) is a decision rule
+                              for the AUTOMATIC splitter -- a human picking a gap
+                              does not rank candidates, and the glyph already
+                              says which mark it is. Solid fill, not an alpha
+                              tint: these chips sit on a glass card whose
+                              transparency the user controls, and the 12% tint
+                              this replaced composited to something LIGHTER than
+                              the opaque chip beside it. */}
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[11.5px] ${
+                              isPunctuation(w.text)
+                                ? 'bg-primary font-semibold text-on-primary'
+                                : 'bg-sunken text-ink-1'
+                            }`}
+                          >
+                            {w.text}
+                          </span>
+                          {wi < e.w1 - e.w0 && (
+                            <button
+                              onClick={() => splitAt(i, wi)}
+                              disabled={player.playing}
+                              className="mx-0.5 grid h-4 w-3 place-items-center rounded text-ink-2 transition-colors hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                              title={t('r.split')}
+                            >
+                              <Scissors size={10} strokeWidth={2.2} />
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </motion.div>

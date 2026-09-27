@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mai2srt"
-version = "0.1.0"
+version = "0.1.1"
 description = "playground.microsoft.ai MAI-Transcribe-2 -> word-timestamp JSON -> SRT"
 requires-python = ">=3.10"
 # classic table form: PEP 639's SPDX-string form needs setuptools>=77

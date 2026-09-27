@@ -45,21 +45,37 @@ PRESETS = {
                    "base_url": "", "auth_style": "bearer"},
 }
 
-#: built-in context/output hints for common model families (tokens)
+#: built-in context/output hints for common model families (tokens). Used ONLY
+#: when the provider's own /models endpoint reports no limits -- DeepSeek,
+#: Gemini and OpenRouter DO report them, bare-id relays do not. A stale value
+#: can only shift how batches are packed (segment/llm.py), never corrupt a
+#: result, so unknown families stay conservative. Verified against the
+#: vendors' docs in 2026-09; re-verify before trusting a number here.
 _BUILTIN_META: list[tuple[str, int, int]] = [
-    (r"deepseek.*(v4|flash)", 128_000, 16_384),
-    (r"deepseek.*(pro|reasoner|r1)", 128_000, 64_000),
-    (r"gpt-5\.4", 400_000, 128_000),
+    (r"deepseek.*(v4|flash)", 1_048_576, 393_216),
+    (r"deepseek.*(pro|reasoner|r1)", 1_048_576, 393_216),
+    (r"gpt-6", 1_050_000, 128_000),
+    (r"gpt-5\.[4-9]", 400_000, 128_000),
+    (r"gpt-5", 400_000, 128_000),
     (r"gpt-4\.1", 1_000_000, 32_768),
     (r"gpt-4o", 128_000, 16_384),
     (r"o[34](-mini)?", 200_000, 100_000),
+    (r"claude.*(fable-5|opus-5|sonnet-5)", 1_000_000, 128_000),
+    (r"claude.*haiku-4-5", 200_000, 64_000),
     (r"claude.*(-4-6|4-6|opus-4-6)", 200_000, 64_000),
     (r"claude.*sonnet-4-5", 200_000, 64_000),
     (r"claude.*haiku", 200_000, 32_768),
-    (r"gemini-3\.[0-9]+-flash", 1_000_000, 65_536),
-    (r"gemini.*pro", 1_000_000, 65_536),
-    (r"glm-5\.[0-9]+", 128_000, 32_768),
+    (r"claude", 200_000, 64_000),
+    (r"gemini-3\.[0-9]+-flash", 1_048_576, 65_536),
+    (r"gemini.*pro", 1_048_576, 65_536),
+    (r"glm-5\.[0-9]+", 1_000_000, 131_072),
+    (r"glm", 128_000, 32_768),
+    (r"qwen3\.[0-9]+-max", 1_000_000, 131_072),
     (r"qwen3", 131_072, 8_192),
+    (r"grok-4\.[0-9]+", 500_000, 128_000),
+    (r"kimi.*k3", 1_048_576, 131_072),
+    (r"minimax-m3", 1_000_000, 524_288),
+    (r"minimax", 1_000_000, 204_800),
 ]
 
 _REASONING_RE = re.compile(
@@ -71,7 +87,13 @@ EFFORT_LEVELS = ("off", "low", "medium", "high", "max")
 
 
 def tag_model(model_id: str, api_meta: dict | None = None) -> dict:
-    """Heuristic capability tagging; API-provided fields win when present."""
+    """Heuristic capability tagging; API-provided fields win when present.
+
+    ``limits_source`` records WHERE the numbers came from, because the two
+    differ in trustworthiness: "api" = the provider reported them (DeepSeek,
+    Gemini, OpenRouter), "builtin" = matched a name pattern in the table
+    below, None = unknown (batching then assumes a conservative floor).
+    """
     meta = {
         "id": model_id,
         "context_window": None,
@@ -79,21 +101,44 @@ def tag_model(model_id: str, api_meta: dict | None = None) -> dict:
         "reasoning": bool(_REASONING_RE.search(model_id)),
         "vision": bool(_VISION_RE.search(model_id)),
         "efforts": None,
+        "limits_source": None,
         "source": "discovered",
     }
     for pat, ctx, out in _BUILTIN_META:
         if re.search(pat, model_id, re.I):
             meta["context_window"] = ctx
             meta["max_output"] = out
+            meta["limits_source"] = "builtin"
             break
     if api_meta:
+        from_api = False
         for k_src, k_dst in (("context_length", "context_window"),
                              ("context_window", "context_window"),
                              ("max_output_tokens", "max_output")):
             v = api_meta.get(k_src)
             if isinstance(v, int) and v > 0:
                 meta[k_dst] = v
-    if meta["reasoning"]:
+                from_api = True
+        # modalities and effort levels are DECLARED, not guessed: the name
+        # heuristics above miss them (e.g. deepseek-flash reports image input
+        # while _VISION_RE has no "deepseek")
+        in_mod = api_meta.get("input_modalities")
+        if isinstance(in_mod, list) and in_mod:
+            meta["vision"] = any(
+                str(m).lower() in ("image", "video") for m in in_mod)
+            from_api = True
+        effort = api_meta.get("effort")
+        if isinstance(effort, dict):
+            levels = [str(x) for x in (effort.get("supported_levels") or []) if x]
+            if levels:
+                meta["efforts"] = levels
+                # advertised effort levels mean a thinking-capable model
+                if any(str(x).lower() not in ("off", "none") for x in levels):
+                    meta["reasoning"] = True
+                from_api = True
+        if from_api:
+            meta["limits_source"] = "api"
+    if meta["reasoning"] and not meta["efforts"]:
         meta["efforts"] = list(EFFORT_LEVELS)
     return meta
 
@@ -249,7 +294,8 @@ def diff_models(existing: list[dict], discovered: list[dict]) -> dict:
     changed = []
     for mid, m in new.items():
         if mid in old:
-            keys = ("context_window", "max_output", "reasoning", "vision")
+            keys = ("context_window", "max_output", "reasoning", "vision",
+                    "efforts", "limits_source")
             delta = {k: {"from": old[mid].get(k), "to": m.get(k)}
                      for k in keys if old[mid].get(k) != m.get(k)}
             if delta:

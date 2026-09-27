@@ -45,6 +45,10 @@ class RunResult:
     # segmentation as an origin=llm edit record without re-deriving it
     entry_list: list | None = None
     word_refs: list | None = None
+    #: None = the LLM was not requested or did its job; otherwise the reason
+    #: some or all over-limit runs fell back to the deterministic split (see
+    #: build_entries). Surfaced to the UI so a silent quality loss is visible.
+    llm_note: str | None = None
 
 
 StageCb = Callable[[str, str], None]     # (stage, detail)
@@ -292,7 +296,7 @@ async def run_full(
     # segmentation + LLM split-point calls are blocking (sync HTTP): offload.
     # build_entries (not finish_srt) so the entry structure survives for the
     # refine hand-off edit record
-    entries, _llm_note = await asyncio.to_thread(
+    entries, llm_note = await asyncio.to_thread(
         build_entries, cfg, stitched.transcript, stitched.audio_duration_s,
         segment_params, post_params, use_llm, on_stage, on_log)
     n_dial = sum(1 for e in entries if e.is_dialogue)
@@ -300,12 +304,15 @@ async def run_full(
     srt_path = audio.parent / (audio.stem + ".srt")
     srt_path.write_text(srt, encoding="utf-8")
     on_log("wrote %s" % srt_path)
+    if llm_note:
+        on_log("大模型断句未完全生效：%s" % llm_note)
     return RunResult(
         doc=doc, srt=srt, json_path=json_path, srt_path=srt_path,
         words=len(stitched.transcript.words),
         entries=len(entries), dialogue=n_dial,
         entry_list=entries,
-        word_refs=sorted(stitched.transcript.words, key=lambda w: w.start))
+        word_refs=sorted(stitched.transcript.words, key=lambda w: w.start),
+        llm_note=llm_note)
 
 
 async def login_flow(cfg: Config, on_log: LogCb = _default_log) -> int:

@@ -137,7 +137,13 @@ Write-Host "    $($patterns.Count) patterns, no hits"
 
 # ------------------------------------------------------- 4. what would ship
 Step "current public tip"
-$publicTip = (& git rev-parse --verify --quiet "refs/heads/$Branch")
+# The snapshot branch has the same name as the remote ("public"), so a bare
+# "$Branch" is ambiguous to git -- it warns, and which ref it resolves to is
+# git's choice, not ours. Everything that reads the branch uses this full ref;
+# only `git branch -f` (which creates/moves the branch itself) takes the name.
+$BranchRef = "refs/heads/$Branch"
+
+$publicTip = (& git rev-parse --verify --quiet $BranchRef)
 $hasBranch = ($LASTEXITCODE -eq 0 -and $publicTip)
 if ($hasBranch) { Write-Host "    $Branch = $($publicTip.Substring(0,7))" }
 else { Write-Host "    no '$Branch' branch yet -- this will be the first (root) publish" }
@@ -153,11 +159,11 @@ $files = @(& git ls-tree -r --name-only master)
 Step "change set (public -> master)"
 $nothingToPublish = $false
 if ($hasBranch) {
-    if ((& git rev-parse "$Branch^{tree}") -eq $masterTree) {
+    if ((& git rev-parse "$BranchRef^{tree}") -eq $masterTree) {
         $nothingToPublish = $true
         Write-Host "    nothing to publish: $Branch already has master's tree"
     } else {
-        & git --no-pager diff --stat $Branch master | Out-Host
+        & git --no-pager diff --stat $BranchRef master | Out-Host
     }
 } else {
     Write-Host "    $($files.Count) files will become the single root commit"
@@ -208,7 +214,7 @@ if (-not $nothingToPublish) {
     if ($LASTEXITCODE -ne 0) { Fail "git branch -f $Branch failed" }
     $publicTip = $new
     Write-Host "    $Branch = $($new.Substring(0,7)) $Message"
-    & git diff --quiet $Branch master
+    & git diff --quiet $BranchRef master
     if ($LASTEXITCODE -ne 0) {
         Fail "the snapshot tree does not match master -- aborting before any push"
     }
@@ -229,7 +235,7 @@ if ($Tag) {
     Step "tagging $Tag"
     & git rev-parse --verify --quiet "refs/tags/$Tag" | Out-Null
     if ($LASTEXITCODE -eq 0) { Fail "tag $Tag already exists locally; pick another name" }
-    & git tag -a $Tag -m "mai2srt v$version" $Branch
+    & git tag -a $Tag -m "mai2srt v$version" $BranchRef
     if ($LASTEXITCODE -ne 0) { Fail "git tag failed" }
     Invoke-Git push $Remote "refs/tags/$Tag"
     if ($LASTEXITCODE -ne 0) { Fail "tag push failed" }
@@ -247,7 +253,11 @@ Write-Host "    remote $TargetBranch = $($remoteSha.Substring(0,7)) -- matches"
 
 Write-Host ""
 Write-Host "Done. Public history:" -ForegroundColor Green
-& git --no-pager log --oneline -5 $Branch | Out-Host
+& git --no-pager log --oneline -5 $BranchRef | Out-Host
 Write-Host ""
 Write-Host "The private history is untouched. Back it up with branches (not tags):"
 Write-Host "    git push $PrivateRemote master $Branch"
+if ($Force) {
+    Write-Host "    (that push needs --force for '$Branch' too: a re-rooted snapshot is not"
+    Write-Host "     a fast-forward of the old one -- git push --force $PrivateRemote $Branch)"
+}

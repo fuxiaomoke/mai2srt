@@ -220,6 +220,9 @@ export interface DoneData {
   words?: number;
   entries?: number;
   dialogue?: number;
+  // None/absent = LLM off or fully applied; a string = some or all over-limit
+  // runs fell back to the deterministic split (quality loss, worth a warning)
+  llm_note?: string | null;
 }
 
 export async function getSystem(): Promise<SystemInfo> {
@@ -228,6 +231,26 @@ export async function getSystem(): Promise<SystemInfo> {
   const data = await r.json();
   warm.system = data;
   return data;
+}
+
+/** Prerequisite key reported by /api/preflight (the UI owns the wording). */
+export type PreflightKey = 'ffmpeg' | 'browser' | 'session' | 'llm';
+
+export interface PreflightResult {
+  ok: boolean;
+  missing: PreflightKey[];
+}
+
+/** What a job is missing before it may start. Static + instant (no network
+ *  probe): the live session check happens inside the job. */
+export async function preflight(
+  kind: 'run' | 'process',
+  useLlm: boolean,
+): Promise<PreflightResult> {
+  const q = new URLSearchParams({ kind, use_llm: useLlm ? '1' : '0' });
+  const r = await fetch(`${API_BASE}/api/preflight?${q}`);
+  if (!r.ok) throw new Error(`preflight: HTTP ${r.status}`);
+  return r.json();
 }
 
 export async function createJob(body: {
@@ -309,6 +332,9 @@ export interface ModelMeta {
   vision: boolean;
   efforts: string[] | null;
   source?: string;
+  // where context_window/max_output came from: 'api' (provider reported them),
+  // 'builtin' (matched a name pattern -- less trustworthy), or null/absent
+  limits_source?: 'api' | 'builtin' | null;
 }
 
 export interface Provider {

@@ -26,6 +26,21 @@ def _task(run_id: int, text: str = "あいう。かきく。さしす。"):
     return SplitTask(run_id, words, find_candidates(words, 0.8))
 
 
+def _blocks(user: str) -> list[tuple[int, str]]:
+    """Parse the [id=N] blocks back out of a split request."""
+    out = []
+    for part in user.split("\n[id=")[1:]:
+        head, _, tail = part.partition("]\n")
+        out.append((int(head), tail.strip("\n")))
+    return out
+
+
+def _echo(user: str) -> str:
+    """A reply that returns every block verbatim as a single line."""
+    return '{"results": [%s]}' % ", ".join(
+        '{"id": %d, "lines": ["%s"]}' % (rid, txt) for rid, txt in _blocks(user))
+
+
 # ------------------------------------------------------------------ prompt
 
 def test_prompt_free_text_shape_and_range():
@@ -103,7 +118,7 @@ def test_choose_partial_failure_returns_partial(monkeypatch):
 
     calls = {"summary": 0, "split": 0}
 
-    def fake_request(endpoint, system, user):
+    def fake_request(endpoint, system, user, **_kw):
         if system == llm._SUMMARY_SYSTEM_PROMPT:
             calls["summary"] += 1
             return "摘要：测试。"
@@ -124,7 +139,7 @@ def test_choose_total_failure_raises(monkeypatch):
     monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
     sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"))
 
-    def fake_request(endpoint, system, user):
+    def fake_request(endpoint, system, user, **_kw):
         if system == llm._SUMMARY_SYSTEM_PROMPT:
             return "摘要。"
         return "garbage"
@@ -143,7 +158,7 @@ def test_choose_summary_failure_is_non_fatal(monkeypatch):
     logs: list[str] = []
     sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"), log=logs.append)
 
-    def fake_request(endpoint, system, user):
+    def fake_request(endpoint, system, user, **_kw):
         if system == llm._SUMMARY_SYSTEM_PROMPT:
             raise LLMSplitError("HTTP 500 from x: boom")
         # split request must arrive WITHOUT the summary block
@@ -162,7 +177,7 @@ def test_choose_misaligned_reply_is_not_returned(monkeypatch):
     monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
     sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"))
 
-    def fake_request(endpoint, system, user):
+    def fake_request(endpoint, system, user, **_kw):
         if system == llm._SUMMARY_SYSTEM_PROMPT:
             return "摘要。"
         # silently drops the last sentence -> alignment coverage failure
@@ -175,3 +190,167 @@ def test_choose_misaligned_reply_is_not_returned(monkeypatch):
     except LLMSplitError:
         raised = True
     assert raised
+
+
+# ------------------------------------------------- generation-cap batching
+
+def test_output_cap_only_for_batches_that_need_one(monkeypatch):
+    """A small reply rides the platform default; a batch big enough to outgrow
+    it asks for an explicit ceiling (the reply is the same text re-emitted)."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    caps: list = []
+
+    def run_one(text: str):
+        caps.clear()
+        sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"))
+
+        def fake_request(endpoint, system, user, **kw):
+            if system == llm._SUMMARY_SYSTEM_PROMPT:
+                return "摘要。"
+            caps.append(kw.get("output_tokens"))
+            return '{"results": [{"id": 1, "lines": ["%s"]}]}' % text
+
+        monkeypatch.setattr(llm, "_request", fake_request)
+        return sp.choose([_task(1, text)], SegmentParams())
+
+    run_one("あいう。かきく。")
+    assert caps == [None]                      # 25 tokens expected: send nothing
+
+    text = "あ" * 6000                         # ~3.6K text + scaffolding: over the floor
+    out = run_one(text)
+    need = int((len(text) * llm._CHARS_PER_TOKEN + llm._TASK_OVERHEAD_TOKENS)
+               * llm._JSON_OVERHEAD)
+    assert caps == [need]
+    assert caps[0] > llm._OUTPUT_CAP_FLOOR_TOKENS
+    assert [join_words(pc) for pc in out[1]] == [text]
+
+
+def test_output_cap_rejection_retries_without_and_shrinks(monkeypatch):
+    """An endpoint that refuses the cap field is not a failure: the field is
+    dropped for the rest of the job and later batches shrink to a ceiling a
+    platform default is known to cover."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    logs: list[str] = []
+    sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"), log=logs.append)
+    text = "あ" * 6000
+    caps: list = []
+
+    def fake_request(endpoint, system, user, **kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        caps.append(kw.get("output_tokens"))
+        if kw.get("output_tokens"):
+            raise LLMSplitError("HTTP 400 from x: Unsupported parameter: "
+                                "max_completion_tokens")
+        return '{"results": [{"id": 1, "lines": ["%s"]}]}' % text
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1, text)], SegmentParams())
+
+    assert caps[0] and caps[1] is None          # asked, refused, retried bare
+    assert [join_words(pc) for pc in out[1]] == [text]    # still succeeded
+    assert any("端点不接受生成上限参数" in m for m in logs)
+    assert sp._cap_chars == int(llm._ASSUMED_DEFAULT_OUTPUT_TOKENS
+                                * llm._OUTPUT_SAFETY / llm._CHARS_PER_TOKEN)
+    # the tighter ceiling now governs packing
+    many = [_task(i, "あ" * 61 + "。") for i in range(300)]
+    batches = sp._batches(many)
+    assert len(batches) > 1
+    assert all(sum(len(join_words(t.words)) for t in b) <= sp._cap_chars
+               for b in batches)
+
+
+# ------------------------------------------------------- progress reporting
+
+def test_every_batch_and_the_total_are_logged(monkeypatch):
+    """A multi-batch job runs for minutes: it must narrate itself instead of
+    leaving the UI log blank between "摘要生成成功" and the end."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    logs: list[str] = []
+    sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"), log=logs.append)
+
+    def fake_request(endpoint, system, user, **kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    tasks = [_task(i, "あ" * 61 + "。") for i in range(700)]   # 43_400 chars
+    out = sp.choose(tasks, SegmentParams())
+
+    assert len(out) == 700
+    assert any("断句：700 段，分 2 批" in m for m in logs)
+    assert any("断句批次 1/2" in m for m in logs)
+    assert any("断句批次 2/2" in m for m in logs)
+    assert any(m.startswith("断句完成：700/700") for m in logs)
+
+
+def test_summary_input_is_trimmed_to_the_context_budget(monkeypatch):
+    """The summary call is NOT batched, so a long job must be trimmed to the
+    prompt budget rather than failing and silently losing the context."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    logs: list[str] = []
+    ep = LLMEndpoint(api_key="k", model="m", context_window=8_000)   # 5333 chars
+    sp = ProtocolSplitter(ep, log=logs.append)
+    seen: dict = {}
+
+    def fake_request(endpoint, system, user, **kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            seen["summary"] = user
+            return "摘要。"
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    sp.choose([_task(i, "あ" * 600) for i in range(20)], SegmentParams())
+
+    assert ep.input_budget_chars() == int(8_000 * 0.4 / 0.6)
+    assert len(seen["summary"]) <= ep.input_budget_chars() + 8   # "\n...\n"
+    assert seen["summary"].startswith("あ")
+    assert seen["summary"].rstrip().endswith("あ")
+    assert any("超出输入预算" in m for m in logs)
+
+
+def test_partial_split_is_reported_through_llm_status():
+    """A run the splitter never answers for falls back deterministically in
+    the RESULT -- and the user must be told, not just the log."""
+    from mai2srt.segment.pipeline import segment_transcript
+    from mai2srt.transcribe.parser import Transcript
+
+    words: list[Word] = []
+    t0 = 0.0
+    for spk in ("1", "2"):                      # two over-limit runs
+        for k in range(80):
+            words.append(Word("あ", t0 + k * 0.2, t0 + k * 0.2 + 0.15, spk))
+        t0 += 20.0
+    t = Transcript(words=words, duration_s=40.0, language="ja")
+
+    class HalfSplitter:
+        """Answers for the first task only -- the second one degrades."""
+
+        def choose(self, tasks, params):
+            first = tasks[0]
+            return {first.run_id: [list(first.words)]}
+
+    status: list[str] = []
+    segs = segment_transcript(t, SegmentParams(), splitter=HalfSplitter(),
+                              llm_status=status)
+    assert status and "1/2" in status[0]
+    assert "未能对齐" in status[0]
+    assert len(segs) >= 2                       # both runs still produced lines
+
+
+def test_total_split_success_reports_nothing():
+    from mai2srt.segment.pipeline import segment_transcript
+    from mai2srt.transcribe.parser import Transcript
+
+    words = [Word("あ", i * 0.2, i * 0.2 + 0.15, "1") for i in range(80)]
+    t = Transcript(words=words, duration_s=20.0, language="ja")
+
+    class AllSplitter:
+        def choose(self, tasks, params):
+            return {t_.run_id: [list(t_.words)] for t_ in tasks}
+
+    status: list[str] = []
+    segment_transcript(t, SegmentParams(), splitter=AllSplitter(),
+                       llm_status=status)
+    assert status == []

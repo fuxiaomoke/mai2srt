@@ -18,13 +18,23 @@ import { useI18n } from '../../lib/i18n';
 /* ------------------------------------------------------------ model caps */
 
 function ModelCaps({ m }: { m: ModelMeta }) {
+  // "≈" marks a limit that came from the built-in name table rather than the
+  // provider: the number also drives batching, so its trust level is worth
+  // showing (no mark = reported by the API, nothing at all = unknown).
+  const guessed = m.limits_source === 'builtin' ? '≈' : '';
+  const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
   return (
     <span className="flex items-center gap-1.5 text-ink-3">
       {m.reasoning && <Brain size={12} strokeWidth={2} aria-label="reasoning" />}
       {m.vision && <Eye size={12} strokeWidth={2} aria-label="vision" />}
       {m.context_window && (
         <span className="font-mono text-[10px]">
-          {m.context_window >= 1000 ? `${Math.round(m.context_window / 1000)}k` : m.context_window}
+          {guessed}{k(m.context_window)}
+        </span>
+      )}
+      {m.max_output && (
+        <span className="font-mono text-[10px]" title="max output tokens">
+          out {guessed}{k(m.max_output)}
         </span>
       )}
     </span>

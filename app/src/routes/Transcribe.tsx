@@ -8,11 +8,19 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { Button, Card, StatusDot, Toggle, useToast } from '../components/ui';
 import { useI18n, type Key } from '../lib/i18n';
 import {
-  cancelJob, createJob, getSubtitleParams, getSystem, revealPath, subscribeJob,
-  warmParams, warmSystem,
-  type DoneData, type SubtitleParams, type SystemInfo,
+  cancelJob, createJob, getSubtitleParams, getSystem, preflight, revealPath,
+  subscribeJob, warmParams, warmSystem, withBackendRetry,
+  type DoneData, type PreflightKey, type SubtitleParams, type SystemInfo,
 } from '../lib/api';
 import { loadUseLlm, storeUseLlm } from '../lib/subtitle';
+
+/** how a missing prerequisite is named in the refusal toast */
+const PREFLIGHT_LABEL: Record<PreflightKey, Key> = {
+  ffmpeg: 't.pre.ffmpeg',
+  browser: 't.pre.browser',
+  session: 't.pre.session',
+  llm: 't.pre.llm',
+};
 
 const STAGES: { id: string; label: Key; icon: typeof FileAudio }[] = [
   { id: 'prepare', label: 't.stage.prepare', icon: FileAudio },
@@ -73,11 +81,19 @@ export function TranscribePage() {
   };
 
   useEffect(() => {
-    getSystem().then(setSys).catch(() => {});
-    getSubtitleParams()
-      .then(({ params: p }) => setParams(p))
-      .catch(() => {});
-    return () => disposeRef.current?.();
+    // retry-wrapped: this page mounts BEFORE the startup prefetch settles, so
+    // its own first fetch lands while the packaged sidecar may still be
+    // booting. A one-shot fetch then failed once and left the status line and
+    // the params card invisible for good (they only reappear after the user
+    // switches pages and the warm cache happens to be filled by then).
+    let alive = true;
+    withBackendRetry(() => getSystem())
+      .then((s) => { if (alive) setSys(s); })
+      .catch(() => { if (alive) toast('warn', t('t.toast.backendDown')); });
+    withBackendRetry(() => getSubtitleParams())
+      .then(({ params: p }) => { if (alive) setParams(p); })
+      .catch(() => { /* the status-line toast above already said it */ });
+    return () => { alive = false; disposeRef.current?.(); };
   }, []);
 
   useEffect(() => {
@@ -129,12 +145,26 @@ export function TranscribePage() {
 
   async function start() {
     if (busy) return;
+    // busy FIRST (a double click must not fire two preflights), but the page
+    // state is only cleared once the job is really going to start: a refused
+    // click must not wipe the previous run's result and log
     setStarting(true);
-    setError('');
-    setResult(null);
-    setLogs([]);
-    setStage('');
     try {
+      // refuse up front rather than watch the job die a minute later: the
+      // backend names exactly which prerequisite is missing (static check,
+      // instant -- an expired session is still caught inside the job)
+      const kind = isJson ? 'process' : 'run';
+      const pf = await preflight(kind, useLlm).catch(() => null);
+      if (pf && !pf.ok) {
+        toast('warn', tf('t.toast.missing', {
+          items: pf.missing.map((k) => t(PREFLIGHT_LABEL[k])).join('、'),
+        }));
+        return;
+      }
+      setError('');
+      setResult(null);
+      setLogs([]);
+      setStage('');
       const job = await createJob(
         isJson
           ? { kind: 'process', mai_json_path: path, use_llm: useLlm }
@@ -147,6 +177,11 @@ export function TranscribePage() {
         onDone: (d) => {
           setResult(d);
           toast('ok', t('t.toast.done'));
+          // a partial LLM failure is a quality loss, not a crash: the run
+          // succeeded, so warn instead of pretending everything used the model
+          if (d.llm_note) {
+            toast('warn', tf('t.toast.llmDegraded', { err: String(d.llm_note).slice(0, 120) }));
+          }
           getSystem().then(setSys).catch(() => {});
         },
         onError: (m) => {
