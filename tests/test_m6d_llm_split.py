@@ -192,6 +192,119 @@ def test_choose_misaligned_reply_is_not_returned(monkeypatch):
     assert raised
 
 
+def test_thinking_form_400_flips_to_effort_and_retries(monkeypatch):
+    """Claude 4.7+ reject thinking.type=enabled with a 400. A relay that
+    renamed its models hides that from the name heuristics -- the splitter
+    must flip the parameter form on that 400 and retry the batch instead
+    of degrading it."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    logs: list[str] = []
+    sp = ProtocolSplitter(
+        LLMEndpoint(protocol="anthropic", api_key="k", effort="high",
+                    model="claude-relay-alias"),   # unparseable -> budget
+        log=logs.append)
+    seen: list[str] = []
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        seen.append(endpoint.resolve_thinking_mode())
+        if len(seen) == 1:
+            raise LLMSplitError(
+                'HTTP 400 from x: "thinking.type.enabled" is not supported')
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1)], SegmentParams())
+    assert seen == ["budget", "effort"]           # flipped, then succeeded
+    assert sp.e.thinking_mode == "effort"         # remembered for the job
+    assert any("思考参数形式" in m for m in logs)
+    assert list(out.keys()) == [1]
+
+
+def test_thinking_form_400_flips_back_to_budget(monkeypatch):
+    """The reverse shape also self-corrects: an Opus 4.5-era endpoint (or a
+    relay that strips output_config) rejects the effort form -> fall back
+    to budget_tokens."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    sp = ProtocolSplitter(
+        LLMEndpoint(protocol="anthropic", api_key="k", effort="high",
+                    model="claude-opus-4-6"))      # name says effort
+    seen: list[str] = []
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        seen.append(endpoint.resolve_thinking_mode())
+        if len(seen) == 1:
+            raise LLMSplitError(
+                "HTTP 400 from x: output_config is not supported by this model")
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1)], SegmentParams())
+    assert seen == ["effort", "budget"]
+    assert sp.e.thinking_mode == "budget"
+    assert list(out.keys()) == [1]
+
+
+def test_gemini_thinking_400_drops_thinking_and_retries(monkeypatch):
+    """A level the model does not take (3-series Pro accepts low/high only,
+    a renamed relay alias hides that from the name) kills thinkingConfig
+    for the rest of the job instead of degrading the batch."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    logs: list[str] = []
+    sp = ProtocolSplitter(
+        LLMEndpoint(protocol="gemini", api_key="k", effort="medium",
+                    model="gemini-relay-alias"),
+        log=logs.append)
+    sent: list[dict] = []
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        sent.append(endpoint.effort_kwargs())
+        if len(sent) == 1:
+            raise LLMSplitError(
+                "HTTP 400: Invalid thinkingLevel medium. "
+                "Valid values are: low, high")
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1)], SegmentParams())
+    assert sent[0] != {} and sent[1] == {}       # thinking, then dropped
+    assert sp.e.thinking_mode == "none"
+    assert any("已关闭思考" in m for m in logs)
+    assert list(out.keys()) == [1]
+
+
+def test_openai_reasoning_effort_400_drops_it_and_retries(monkeypatch):
+    """Not every openai-compatible backend takes reasoning_effort; one 4xx
+    naming the field drops it for the rest of the job instead of letting
+    the batch degrade to rule-based splitting."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    sp = ProtocolSplitter(
+        LLMEndpoint(protocol="openai", api_key="k", effort="high",
+                    model="some-relay-model"))
+    sent: list[dict] = []
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        sent.append(endpoint.effort_kwargs())
+        if len(sent) == 1:
+            raise LLMSplitError(
+                "HTTP 400: Unrecognized request argument supplied: "
+                "reasoning_effort")
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1)], SegmentParams())
+    assert sent[0] == {"reasoning_effort": "high"} and sent[1] == {}
+    assert sp.e.thinking_mode == "none"
+    assert list(out.keys()) == [1]
+
+
 # ------------------------------------------------- generation-cap batching
 
 def test_output_cap_only_for_batches_that_need_one(monkeypatch):

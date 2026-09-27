@@ -6,4 +6,4 @@ Pipeline: audio -> (probe/compress/chunk) -> browser-context transcription
 All playground protocol knowledge lives in `transcribe.client`; the shapes
 were validated by the M0 spike (see _research/RESEARCH.md).
 """
-__version__ = "0.1.1"
+__version__ = "0.1.2"

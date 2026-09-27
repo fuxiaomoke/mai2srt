@@ -64,6 +64,68 @@ def test_tag_model_reads_declared_modalities_and_efforts():
     assert o["reasoning"] is False
 
 
+def test_tag_model_claude_generation_split():
+    """Claude thinks since 3.7; 3.0/3.5 never did. Both wild naming shapes
+    (claude-3-7-sonnet / claude-opus-4-6) must tag reasoning, while the
+    non-thinking generation stays out even when a "-5" minor version
+    appears in the name (claude-3-5-sonnet)."""
+    for mid in ("claude-opus-4-6", "claude-opus-5", "claude-sonnet-4-5-20250929",
+                "claude-3-7-sonnet-latest", "claude-4-1-20250805",
+                "claude-haiku-4-5", "claude-fable-5"):
+        m = llm_admin.tag_model(mid)
+        assert m["reasoning"] is True, mid
+        assert m["efforts"] == list(llm_admin.EFFORT_LEVELS), mid
+    for mid in ("claude-3-5-sonnet-20240620", "claude-3-5-haiku",
+                "claude-3-opus-20240229", "claude-2-1"):
+        assert llm_admin.tag_model(mid)["reasoning"] is False, mid
+
+
+def test_tag_model_gemini_generation_split():
+    """Official thinking doc: "Gemini 3 and 2.5 series models use a
+    thinking process" -- 1.5/2.0 never did. Version-less relay aliases
+    (gemini-3-flash) must tag too, and pick up the built-in limits row."""
+    for mid in ("gemini-3.8-flash", "gemini-3.1-pro-preview",
+                "gemini-3-flash-preview", "gemini-3-flash",
+                "gemini-2.5-pro", "gemini-2.5-flash",
+                "gemini-3.8-flash-high"):
+        m = llm_admin.tag_model(mid)
+        assert m["reasoning"] is True, mid
+        assert m["efforts"] == list(llm_admin.EFFORT_LEVELS), mid
+    # the catch-all limits row covers aliases the specific rows miss
+    m = llm_admin.tag_model("gemini-3-flash")
+    assert m["context_window"] == 1_048_576 and m["max_output"] == 65_536
+    for mid in ("gemini-2.0-flash", "gemini-1.5-pro", "gemini-embedding"):
+        assert llm_admin.tag_model(mid)["reasoning"] is False, mid
+
+
+def test_presets_offer_only_formats_the_vendor_serves():
+    """The urls keys ARE the formats the add-provider card may offer
+    (verified against the vendors' docs, 2026-09); the default protocol
+    must itself be one of them."""
+    expected = {
+        "deepseek": {"openai", "anthropic"},
+        "openai": {"openai"},
+        "anthropic": {"anthropic"},
+        "gemini": {"gemini", "openai"},      # OpenAI-compat layer /v1beta/openai
+        "openrouter": {"openai", "anthropic"},
+        "ollama": {"openai", "anthropic"},   # Messages API compat since v0.14.0
+        "custom": {"openai", "anthropic", "gemini"},
+    }
+    for pid, formats in expected.items():
+        p = llm_admin.PRESETS[pid]
+        assert set(p["urls"]) == formats, pid
+        assert p["protocol"] in p["urls"], pid
+    # the multi-format endpoint swaps are part of the contract
+    assert llm_admin.PRESETS["deepseek"]["urls"]["anthropic"] == \
+        "https://api.deepseek.com/anthropic"
+    assert llm_admin.PRESETS["openrouter"]["urls"]["anthropic"] == \
+        "https://openrouter.ai/api"
+    assert llm_admin.PRESETS["ollama"]["urls"]["anthropic"] == \
+        "http://127.0.0.1:11434"
+    assert llm_admin.PRESETS["gemini"]["urls"]["openai"] == \
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
 def test_diff_models():
     existing = [{"id": "a", "reasoning": False, "context_window": 8},
                 {"id": "b", "reasoning": False}]

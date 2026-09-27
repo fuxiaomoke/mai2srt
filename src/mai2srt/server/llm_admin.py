@@ -15,34 +15,50 @@ from pathlib import Path
 
 from ..config import Config, load_app_config, save_app_config
 from ..net import USER_AGENT
+from ..segment.llm import LLMEndpoint, _build_request, _content, _openai_path
 
 PROTOCOLS = ("openai", "anthropic", "gemini")
 AUTH_STYLES = ("bearer", "x-api-key", "query-key", "none")
 
-#: one-click presets (id -> display info). `alt_base_urls` maps a
-#: NON-default protocol to its default endpoint so the add-provider card
-#: can retarget the URL on API-format switch; verified endpoints:
-#: OpenRouter Anthropic-format base https://openrouter.ai/api (SDK then
-#: appends /v1/messages), DeepSeek Anthropic-format base
-#: https://api.deepseek.com/anthropic.
+#: one-click presets (id -> display info). ``urls`` maps each API format
+#: the vendor ACTUALLY serves to its default endpoint -- its keys are
+#: exactly the formats the add-provider card may offer, and ``protocol``
+#: is the initially selected one. Verified against the vendors' docs in
+#: 2026-09:
+#:   DeepSeek      https://api.deepseek.com/anthropic (Anthropic-format page)
+#:   OpenAI        OpenAI format only
+#:   Anthropic     Anthropic format only
+#:   Gemini        native + OpenAI-compat layer at /v1beta/openai (an
+#:                 extra /v1 after it 404s -- see _openai_path)
+#:   OpenRouter    https://openrouter.ai/api (Anthropic-format page)
+#:   Ollama        Anthropic Messages API compat since v0.14.0 (2026-01);
+#:                 local auth is ignored, "none" keeps the key optional
 PRESETS = {
     "deepseek":   {"name": "DeepSeek 官方", "protocol": "openai",
-                   "base_url": "https://api.deepseek.com", "auth_style": "bearer",
-                   "alt_base_urls": {"anthropic": "https://api.deepseek.com/anthropic"}},
+                   "auth_style": "bearer",
+                   "urls": {"openai": "https://api.deepseek.com",
+                            "anthropic": "https://api.deepseek.com/anthropic"}},
     "openai":     {"name": "OpenAI", "protocol": "openai",
-                   "base_url": "https://api.openai.com/v1", "auth_style": "bearer"},
+                   "auth_style": "bearer",
+                   "urls": {"openai": "https://api.openai.com/v1"}},
     "anthropic":  {"name": "Anthropic Claude", "protocol": "anthropic",
-                   "base_url": "https://api.anthropic.com", "auth_style": "x-api-key"},
+                   "auth_style": "x-api-key",
+                   "urls": {"anthropic": "https://api.anthropic.com"}},
     "gemini":     {"name": "Google Gemini", "protocol": "gemini",
-                   "base_url": "https://generativelanguage.googleapis.com",
-                   "auth_style": "query-key"},
+                   "auth_style": "query-key",
+                   "urls": {"gemini": "https://generativelanguage.googleapis.com",
+                            "openai": "https://generativelanguage.googleapis.com/v1beta/openai"}},
     "openrouter": {"name": "OpenRouter", "protocol": "openai",
-                   "base_url": "https://openrouter.ai/api/v1", "auth_style": "bearer",
-                   "alt_base_urls": {"anthropic": "https://openrouter.ai/api"}},
+                   "auth_style": "bearer",
+                   "urls": {"openai": "https://openrouter.ai/api/v1",
+                            "anthropic": "https://openrouter.ai/api"}},
     "ollama":     {"name": "Ollama (local)", "protocol": "openai",
-                   "base_url": "http://127.0.0.1:11434/v1", "auth_style": "none"},
-    "custom":     {"name": "自定义 OpenAI 兼容", "label": "自定义", "protocol": "openai",
-                   "base_url": "", "auth_style": "bearer"},
+                   "auth_style": "none",
+                   "urls": {"openai": "http://127.0.0.1:11434/v1",
+                            "anthropic": "http://127.0.0.1:11434"}},
+    "custom":     {"name": "自定义 OpenAI 兼容", "label": "自定义",
+                   "protocol": "openai", "auth_style": "bearer",
+                   "urls": {"openai": "", "anthropic": "", "gemini": ""}},
 }
 
 #: built-in context/output hints for common model families (tokens). Used ONLY
@@ -68,6 +84,10 @@ _BUILTIN_META: list[tuple[str, int, int]] = [
     (r"claude", 200_000, 64_000),
     (r"gemini-3\.[0-9]+-flash", 1_048_576, 65_536),
     (r"gemini.*pro", 1_048_576, 65_536),
+    # thinking-era Gemini catch-all: covers version-less aliases relays
+    # invent ("gemini-3-flash", "gemini-2.5-flash") that the two rows
+    # above miss; 1M/64K holds across the whole 2.5+ line
+    (r"gemini-(2\.5|[3-9])", 1_048_576, 65_536),
     (r"glm-5\.[0-9]+", 1_000_000, 131_072),
     (r"glm", 128_000, 32_768),
     (r"qwen3\.[0-9]+-max", 1_000_000, 131_072),
@@ -80,7 +100,15 @@ _BUILTIN_META: list[tuple[str, int, int]] = [
 
 _REASONING_RE = re.compile(
     r"r1|reasoner|o[134](-mini|-pro)?(\b|-)|think|max|ultra|deepseek-v4|"
-    r"gpt-5|deepseek-flash|deepseek-pro", re.I)
+    r"gpt-5|deepseek-flash|deepseek-pro|"
+    # Claude: thinking-capable since 3.7. Both wild naming shapes appear --
+    # generation-first (claude-3-7-sonnet, claude-4-1) and family-first
+    # (claude-opus-4-6). The (?!3) guard keeps the non-thinking 3.0/3.5
+    # generation out: "claude-3-5-sonnet" must not sneak in via its "-5".
+    r"claude-(?:3[-.]7|[4-9])(\b|-)|claude-(?!3)\w+-[4-9]|"
+    # Gemini: thinking since 2.5 (official thinking doc: "Gemini 3 and 2.5
+    # series models use a thinking process"); 1.5/2.0 stay out
+    r"gemini-(2\.5|[3-9])", re.I)
 _VISION_RE = re.compile(r"vl|4o(\b|-)|gemini|claude|glm-4v|qwen-vl|vision", re.I)
 
 EFFORT_LEVELS = ("off", "low", "medium", "high", "max")
@@ -243,7 +271,7 @@ def discover_models(provider: dict) -> list[dict]:
     auth = provider.get("auth_style", "bearer")
 
     if protocol == "openai":
-        url = base + "/models" if base.endswith("/v1") else base + "/v1/models"
+        url = _openai_path(base, "models")
         hdrs = {"Authorization": "Bearer %s" % key} if (key and auth == "bearer") else {}
         data = _http_json(url, hdrs)
         raw = data.get("data") if isinstance(data, dict) else data
@@ -265,7 +293,8 @@ def discover_models(provider: dict) -> list[dict]:
         for m in data.get("data", []):
             mid = m.get("id")
             if mid:
-                out.append(tag_model(mid))
+                # api fields win when a relay reports limits beyond the id
+                out.append(tag_model(mid, m if isinstance(m, dict) else None))
         return out
     if protocol == "gemini":
         url = base + "/v1beta/models?key=%s&pageSize=1000" % key
@@ -304,66 +333,40 @@ def diff_models(existing: list[dict], discovered: list[dict]) -> dict:
 
 
 def test_provider(provider: dict, model_id: str | None = None,
-                  timeout: float = 60.0) -> dict:
-    """Minimal chat ping to verify credentials + model availability."""
+                  effort: str | None = None, timeout: float = 60.0) -> dict:
+    """Minimal chat ping to verify credentials + model availability.
+
+    Built by the SAME request builder as the real segmentation calls --
+    auth headers, User-Agent, effort/thinking parameters -- so a green test
+    means the exact request shape a job will send is accepted (this is how
+    a relay-side "thinking column stays blank" report gets diagnosed:
+    before, the ping never carried the thinking parameter at all).
+    """
     protocol = provider.get("protocol", "openai")
-    base = provider.get("base_url", "").rstrip("/")
-    key = provider.get("api_key", "")
     model = model_id or (provider.get("models") or [{}])[0].get("id", "")
     if not model:
         raise ValueError("no model to test")
+    meta = next((m for m in provider.get("models", [])
+                 if isinstance(m, dict) and m.get("id") == model), {})
+    endpoint = LLMEndpoint(
+        protocol=protocol,
+        base_url=provider.get("base_url", ""),
+        api_key=provider.get("api_key", ""),
+        model=model, effort=effort,
+        context_window=meta.get("context_window"),
+        max_output=meta.get("max_output"))
+    # no explicit generation cap: a ping must not depend on cap-field
+    # support (jobs only send one once a batch could outgrow a default)
+    url, payload, headers = _build_request(
+        endpoint, "You are a connectivity probe. Reply with: pong", "ping")
 
-    if protocol == "openai":
-        url = base + ("/chat/completions" if base.endswith("/v1")
-                      else "/v1/chat/completions")
-        payload = {"model": model, "messages": [
-            {"role": "user", "content": "ping"}], "max_tokens": 8}
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=body, method="POST", headers={
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/json",
-            "Authorization": "Bearer %s" % key,
-        })
-    elif protocol == "anthropic":
-        url = base + "/v1/messages"
-        payload = {"model": model, "max_tokens": 8,
-                   "messages": [{"role": "user", "content": "ping"}]}
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=body, method="POST", headers={
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/json",
-            "Authorization": "Bearer %s" % key,
-            "x-api-key": key, "anthropic-version": "2023-06-01",
-        })
-    elif protocol == "gemini":
-        url = base + "/v1beta/models/%s:generateContent?key=%s" % (model, key)
-        payload = {"contents": [{"parts": [{"text": "ping"}]}],
-                   "generationConfig": {"maxOutputTokens": 8}}
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=body, method="POST", headers={
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/json"})
-    else:
-        raise ValueError("unknown protocol: %s" % protocol)
-
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return {"ok": True, "model": model,
-                "sample": _extract_sample(protocol, data)}
+                "sample": _content(data, protocol)[:80]}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
         raise ValueError("HTTP %d: %s" % (e.code, detail)) from e
-
-
-def _extract_sample(protocol: str, data: dict) -> str:
-    try:
-        if protocol == "openai":
-            return (data["choices"][0]["message"].get("content") or "")[:80]
-        if protocol == "anthropic":
-            return (data["content"][0].get("text") or "")[:80]
-        if protocol == "gemini":
-            return (data["candidates"][0]["content"]["parts"][0]["text"])[:80]
-    except (KeyError, IndexError, TypeError):
-        pass
-    return ""

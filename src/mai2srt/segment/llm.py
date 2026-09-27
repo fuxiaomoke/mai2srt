@@ -92,6 +92,82 @@ _CAP_FIELD_RE = re.compile(
     r"max_completion_tokens|max_tokens|max_output_tokens|maxOutputTokens|"
     r"maximum.?tokens", re.I)
 
+#: Claude version: an optional family word (claude-opus-4-6) then major and
+#: minor. Family must be LETTERS or "claude-3-7-sonnet" would parse the
+#: "3" as the family and the "7" as the major.
+_CLAUDE_RE = re.compile(
+    r"claude-(?:(fable|mythos|opus|sonnet|haiku)-)?(\d+)(?:[.-](\d+))?", re.I)
+
+#: Gemini version: "gemini-3.8-flash" -> (3, 8), "gemini-2.5-pro" -> (2, 5).
+_GEMINI_RE = re.compile(r"gemini-(\d+)(?:\.(\d+))?", re.I)
+
+#: room left above an explicit maxOutputTokens for Gemini 3 thinking: the
+#: cap counts THOUGHT tokens too (official docs), so the reply budget alone
+#: would truncate the JSON mid-flight once thinking engages
+_GEMINI_THINKING_ALLOWANCE_TOKENS = 16_384
+
+
+def _gemini_generation(model: str) -> tuple[int, int] | None:
+    m = _GEMINI_RE.search(model or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2) or 0)
+
+
+def _openai_path(base: str, leaf: str) -> str:
+    """Join an OpenAI-compatible base URL with an endpoint leaf.
+
+    A base that already names its API root takes the leaf directly: the
+    usual trailing ``/v1``, and Google's OpenAI-compat layer whose root
+    ends in ``/openai`` (inserting an extra ``/v1`` there 404s -- official
+    docs and field reports agree). Anything else gets ``/v1`` inserted.
+    """
+    base = base.rstrip("/")
+    if base.endswith("/v1") or base.endswith("/openai"):
+        return "%s/%s" % (base, leaf)
+    return "%s/v1/%s" % (base, leaf)
+
+
+def _anthropic_thinking_mode(model: str) -> str:
+    """How a model behind an Anthropic-format endpoint takes reasoning depth.
+
+    'effort'  -- adaptive-thinking era: top-level ``output_config.effort``
+                 (Claude 4.7+ and 5.x, Fable/Mythos, Opus 4.5+, Sonnet 4.6+).
+                 These models REJECT ``thinking.type: "enabled"`` with a 400
+                 (Claude 4.6 deprecates it but still accepts both).
+    'budget'  -- legacy extended thinking via ``thinking.budget_tokens``
+                 (Claude 3.7 through 4.5, Claude 4).
+    'none'    -- pre-3.7 Claude: no thinking parameter at all.
+
+    Source: platform.claude.com "Troubleshooting thinking" per-model table.
+    A non-Claude name (another vendor behind an Anthropic-format relay)
+    defaults to 'budget'; a wrong guess self-corrects at runtime via
+    ``_is_thinking_mode_rejection``.
+    """
+    m = _CLAUDE_RE.search(model or "")
+    if not m:
+        # version-less family names exist in the wild ("claude-mythos-
+        # preview"); Fable/Mythos are 5-era, so effort regardless
+        fam_only = re.search(r"claude-(fable|mythos)\b", model or "", re.I)
+        if fam_only:
+            return "effort"
+        return "budget"
+    fam = (m.group(1) or "").lower()
+    maj, minor = int(m.group(2)), int(m.group(3) or 0)
+    if fam in ("fable", "mythos") or maj >= 5:
+        return "effort"
+    if maj == 4:
+        # Opus 4.5+ / Sonnet 4.6+ take the effort parameter; Haiku 4.5
+        # is extended-thinking-only, and Claude 4/4.1 take only budgets
+        if (fam == "opus" and minor >= 5) or (fam == "sonnet" and minor >= 6):
+            return "effort"
+        if not fam and minor >= 7:      # family-less alias, e.g. "claude-4-7"
+            return "effort"
+        return "budget"
+    if maj == 3:
+        return "budget" if minor >= 7 else "none"
+    return "none"
+
 #: conservative token estimate for CJK-heavy subtitle text. The NAME is
 #: historical: every formula in this module treats it as TOKENS PER CHAR
 #: (``tokens = chars * _CHARS_PER_TOKEN``), i.e. 1 token ~ 1.67 characters.
@@ -111,6 +187,12 @@ class LLMEndpoint:
     api_key: str = ""
     model: str = ""
     effort: str | None = None             # off | low | medium | high | max | None
+    #: runtime kill-switch/override of the thinking parameters, set when a
+    #: 4xx rejects the form we chose: anthropic flips between 'effort' |
+    #: 'budget' | 'none' (_is_thinking_mode_rejection); gemini and openai
+    #: only ever go 'none' (_is_gemini_thinking_rejection /
+    #: _is_reasoning_effort_rejection). None = derive from the model name
+    thinking_mode: str | None = None
     context_window: int | None = None     # tokens
     max_output: int | None = None         # tokens
     temperature: float = 0.0
@@ -158,31 +240,87 @@ class LLMEndpoint:
         """
         return max(1, self.output_budget_tokens() // _TASK_OVERHEAD_TOKENS)
 
-    def effort_kwargs(self) -> dict:
-        """Protocol-native reasoning effort; empty when off/unsupported."""
-        if not self.effort or self.effort == "off":
+    def resolve_thinking_mode(self) -> str:
+        """Resolved anthropic thinking mode (name-derived unless overridden)."""
+        if self.protocol != "anthropic":
+            return "budget"               # unused by the other protocols
+        return self.thinking_mode or _anthropic_thinking_mode(self.model)
+
+    def effort_kwargs(self, text_tokens: int | None = None) -> dict:
+        """Protocol-native reasoning effort; empty when off/unsupported.
+
+        ``text_tokens`` is the generation budget the caller wants to keep
+        for the VISIBLE reply (None = unspecified). Anthropic's legacy
+        thinking bills against the same ``max_tokens`` as the reply, so the
+        budget is clamped to leave that room AND to stay strictly below
+        ``max_tokens`` -- the API rejects ``budget_tokens >= max_tokens``
+        and anything under the 1024-token floor.
+        """
+        if not self.effort:
+            return {}
+        if self.effort == "off" and self.protocol != "gemini":
+            # gemini-2.5 can genuinely disable thinking (budget 0) and
+            # handles "off" in its own branch below
             return {}
         if self.protocol == "openai":
+            # dropped at runtime after a 4xx named the field
+            if self.thinking_mode == "none":
+                return {}
             # widely-adopted field; models that lack it ignore or reject --
             # a rejection surfaces as a normal LLM error and degrades safely
             return {"reasoning_effort": self.effort}
         if self.protocol == "anthropic":
+            mode = self.resolve_thinking_mode()
+            if mode == "none":
+                return {}
+            if mode == "effort":
+                # adaptive-thinking era: the effort parameter IS the knob
+                return {"output_config": {"effort": self.effort}}
             budgets = {"low": 1024, "medium": 4096, "high": 16384, "max": 65536}
-            # the thinking budget MUST stay strictly under the request's
-            # max_tokens -- clamp to what this model actually allows
-            # (unknown meta mirrors _build_request's 8192 default); a
-            # model with no room for thinking sends no thinking block
-            cap = (self.max_output or 8192) - 1024
-            budget = min(budgets.get(self.effort, 1024), cap)
+            want = budgets.get(self.effort, 1024)
+            ceiling = self.max_output or 8192
+            # room the visible reply still needs inside max_tokens
+            reply = text_tokens or 2048
+            budget = min(want, ceiling - reply)
             if budget < 1024:
+                # API floor is 1024: no room -> send no thinking block at all
                 return {}
             return {"thinking": {"type": "enabled",
                                  "budget_tokens": budget}}
         if self.protocol == "gemini":
-            # the thinkingLevel enum tops out at HIGH: "max" maps onto it
-            level = "HIGH" if self.effort == "max" else self.effort.upper()
-            return {"generationConfig": {"thinkingConfig": {
-                "thinkingLevel": level}}}
+            # thinkingConfig killed at runtime by a 4xx flip
+            if self.thinking_mode == "none":
+                return {}
+            gen = _gemini_generation(self.model)
+            pro = "pro" in (self.model or "").lower()
+            if gen is None or gen >= (3, 0):
+                # thinkingLevel era. Values are lowercase per the docs'
+                # own REST examples (and LiteLLM's production traffic).
+                # Gemini 3 CANNOT fully disable thinking: "off" sends
+                # nothing and the dynamic default stays on.
+                if self.effort == "off":
+                    return {}
+                # 3-series Pro only accepts low/high (official per-model
+                # table); everything else takes the full enum
+                if pro and self.effort in ("medium", "high", "max"):
+                    level = "high"
+                else:
+                    level = {"low": "low", "medium": "medium",
+                             "high": "high", "max": "high"}.get(self.effort)
+                if not level:
+                    return {}
+                return {"generationConfig": {"thinkingConfig": {
+                    "thinkingLevel": level}}}
+            if gen >= (2, 5):
+                # budget era: an int token budget, 0 = really off
+                budgets = {"off": 0, "low": 1024, "medium": 8_192,
+                           "high": 24_576, "max": 24_576}
+                budget = budgets.get(self.effort)
+                if budget is None:
+                    return {}
+                return {"generationConfig": {"thinkingConfig": {
+                    "thinkingBudget": budget}}}
+            return {}          # pre-2.5: no thinking parameter at all
         return {}
 
 
@@ -257,6 +395,44 @@ def _is_output_cap_rejection(err: str) -> bool:
     if not re.search(r"HTTP 4\d\d", err or ""):
         return False
     return bool(_CAP_FIELD_RE.search(err or ""))
+
+
+def _is_thinking_mode_rejection(err: str, current: str) -> str | None:
+    """Rewrite direction when a 4xx rejects our thinking parameter FORM.
+
+    Returns the mode to switch to ('effort' / 'budget' / 'none'), or None
+    when the error is not about the thinking parameter. Claude 4.7+ reject
+    ``thinking.type: "enabled"`` with a 400; Opus 4.5 and earlier reject the
+    adaptive/effort form; a model that rejects BOTH degrades to 'none' so a
+    job never dies on the parameter shape alone.
+    """
+    if not re.search(r"HTTP 4\d\d", err or ""):
+        return None
+    low = err.lower()
+    if "thinking.type" in low or "budget_tokens" in low:
+        return "effort" if current != "effort" else "none"
+    if "output_config" in low or "effort" in low:
+        return "budget" if current != "budget" else "none"
+    return None
+
+
+def _is_gemini_thinking_rejection(err: str) -> bool:
+    """True when a 4xx rejects our thinkingConfig: a level the model does
+    not take (Pro only accepts low/high), a budget on a level-era model, or
+    the other way round. One strike and thinking is off for the job."""
+    if not re.search(r"HTTP 4\d\d", err or ""):
+        return False
+    return bool(re.search(
+        r"thinkinglevel|thinking_budget|thinkingbudget|thinking_?config", err, re.I))
+
+
+def _is_reasoning_effort_rejection(err: str) -> bool:
+    """True when a 4xx names reasoning_effort: the openai-compatible field
+    is widely adopted but not universal, and a model that rejects unknown
+    fields would otherwise fail the whole batch."""
+    if not re.search(r"HTTP 4\d\d", err or ""):
+        return False
+    return bool(re.search(r"reasoning[_ ]?effort", err, re.I))
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +566,7 @@ def _build_request(endpoint: LLMEndpoint, system: str, user: str,
     """
     p = endpoint.protocol
     if p == "openai":
-        base = endpoint.base_url.rstrip("/")
-        url = base + ("/chat/completions" if base.endswith("/v1")
-                      else "/v1/chat/completions")
+        url = _openai_path(endpoint.base_url, "chat/completions")
         payload: dict = {
             "model": endpoint.model,
             "temperature": endpoint.temperature,
@@ -406,14 +580,29 @@ def _build_request(endpoint: LLMEndpoint, system: str, user: str,
                    "Authorization": "Bearer %s" % endpoint.api_key}
     elif p == "anthropic":
         url = endpoint.base_url.rstrip("/") + "/v1/messages"
+        # effort first: legacy thinking changes how max_tokens composes and
+        # forbids temperature, so the payload depends on what it returns
+        eff = endpoint.effort_kwargs(output_tokens)
+        if eff.get("thinking") and output_tokens:
+            # thinking bills against the SAME max_tokens as the reply: give
+            # the budget ON TOP of the reply's ceiling. effort_kwargs
+            # already shrank it so the sum stays inside the model's
+            # declared maximum -- which also keeps budget < max_tokens.
+            max_tokens = output_tokens + eff["thinking"]["budget_tokens"]
+        else:
+            max_tokens = output_tokens or endpoint.max_output or 8192
         payload = {
             "model": endpoint.model,
-            "max_tokens": output_tokens or endpoint.max_output or 8192,
-            "temperature": endpoint.temperature,
+            "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
-        payload.update(endpoint.effort_kwargs())
+        if not eff:
+            # temperature only goes out when thinking is OFF: extended
+            # thinking requires it 1/unset, and the adaptive-era models
+            # deprecate it outright (the official SDKs dropped the field)
+            payload["temperature"] = endpoint.temperature
+        payload.update(eff)
         # Bearer is Anthropic's documented primary auth header and
         # x-api-key their legacy fallback, so sending BOTH keeps official
         # Anthropic happy while Bearer-only Anthropic-format gateways
@@ -426,10 +615,26 @@ def _build_request(endpoint: LLMEndpoint, system: str, user: str,
     elif p == "gemini":
         url = "%s/v1beta/models/%s:generateContent?key=%s" % (
             endpoint.base_url.rstrip("/"), endpoint.model, endpoint.api_key)
-        gen: dict = {"temperature": endpoint.temperature}
-        gen.update(endpoint.effort_kwargs().get("generationConfig", {}))
+        eff = endpoint.effort_kwargs(output_tokens)
+        think = eff.get("generationConfig", {})
+        gen: dict = {}
+        gen.update(think)
+        ggen = _gemini_generation(endpoint.model)
+        # temperature is deprecated on Gemini 3+ and values < 1.0 actively
+        # degrade them (LiteLLM force-resets it to 1.0); pre-3 keeps it.
+        # An unparseable/absent name is treated as the 3 era.
+        if ggen is not None and ggen < (3, 0):
+            gen["temperature"] = endpoint.temperature
         if output_tokens:
-            gen["maxOutputTokens"] = output_tokens
+            cap = output_tokens
+            if "thinkingLevel" in think.get("thinkingConfig", {}):
+                # maxOutputTokens counts THOUGHT tokens too on Gemini 3:
+                # leave room above the reply budget or the JSON reply
+                # truncates mid-flight once thinking engages
+                cap = min(output_tokens + _GEMINI_THINKING_ALLOWANCE_TOKENS,
+                          endpoint.max_output
+                          or output_tokens + _GEMINI_THINKING_ALLOWANCE_TOKENS)
+            gen["maxOutputTokens"] = cap
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -641,6 +846,38 @@ class ProtocolSplitter:
                 return out
             except LLMSplitError as e:
                 msg = str(e)
+                # thinking-form rejection first (its message can also name
+                # max_tokens, which would misfire the cap fallback below)
+                if self.e.protocol == "anthropic":
+                    flip = _is_thinking_mode_rejection(
+                        msg, self.e.resolve_thinking_mode())
+                    if flip:
+                        # not a failure: the parameter FORM was wrong for
+                        # this model (name heuristics missed, relay renamed
+                        # it) -- remember the working form for the rest of
+                        # the job and retry immediately
+                        self.e.thinking_mode = flip
+                        self._log("端点不接受思考参数形式（%s），改用 %s 重试"
+                                  % (msg[:80],
+                                     {"effort": "effort 参数",
+                                      "budget": "thinking 预算",
+                                      "none": "关闭思考"}[flip]))
+                        continue
+                elif (self.e.protocol == "gemini"
+                        and _is_gemini_thinking_rejection(msg)):
+                    # wrong level for this model (e.g. Pro takes low/high
+                    # only) -- drop thinking for the rest of the job
+                    self.e.thinking_mode = "none"
+                    self._log("端点不接受思考参数（%s），已关闭思考重试"
+                              % msg[:80])
+                    continue
+                elif (self.e.protocol == "openai"
+                        and _is_reasoning_effort_rejection(msg)):
+                    # not every openai-compatible backend takes the field
+                    self.e.thinking_mode = "none"
+                    self._log("端点不接受 reasoning_effort 参数（%s），"
+                              "已关闭思考重试" % msg[:80])
+                    continue
                 if cap is not None and _is_output_cap_rejection(msg):
                     # the endpoint does not accept the field: drop it for the
                     # rest of the job and shrink later batches to a ceiling a

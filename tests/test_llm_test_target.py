@@ -71,7 +71,10 @@ def test_named_model_is_the_one_pinged(monkeypatch):
     out = llm_admin.test_provider(dict(PROVIDER), "second-model")
     assert out["model"] == "second-model"
     assert seen["payload"]["model"] == "second-model"
-    assert seen["payload"]["max_tokens"] == 8      # a ping, not a real call
+    # a ping carries no generation cap: it must not depend on cap-field
+    # support (jobs only send one once a batch could outgrow a default)
+    assert "max_tokens" not in seen["payload"]
+    assert "max_completion_tokens" not in seen["payload"]
 
 
 def test_unnamed_model_falls_back_to_the_first_listed(monkeypatch):
@@ -97,15 +100,36 @@ def test_route_forwards_the_model_query_param(tmp_path, monkeypatch):
     llm_admin.upsert_provider(cfg, PROVIDER)
     calls: list[tuple] = []
 
-    def fake(p, m=None, timeout=60.0):
-        calls.append((p["id"], m))
+    def fake(p, m=None, effort=None, timeout=60.0):
+        calls.append((p["id"], m, effort))
         return {"ok": True, "model": m or "", "sample": ""}
 
     monkeypatch.setattr(llm_admin, "test_provider", fake)
     r = c.post("/api/llm/providers/p1/test", params={"model": "second-model"})
     assert r.status_code == 200
     assert r.json()["model"] == "second-model"
-    assert calls == [("p1", "second-model")]
+    assert calls == [("p1", "second-model", None)]
+
+
+def test_route_forwards_the_effort_query_param(tmp_path, monkeypatch):
+    """The active provider's test carries the active effort, so the ping
+    exercises the request shape a job would send (thinking included)."""
+    c, cfg = _app(tmp_path)
+    llm_admin.upsert_provider(cfg, PROVIDER)
+    calls: list[tuple] = []
+
+    def fake(p, m=None, effort=None, timeout=60.0):
+        calls.append(effort)
+        return {"ok": True, "model": m or "", "sample": ""}
+
+    monkeypatch.setattr(llm_admin, "test_provider", fake)
+    assert c.post("/api/llm/providers/p1/test",
+                  params={"model": "first-model", "effort": "max"}
+                  ).status_code == 200
+    assert calls == ["max"]
+    # an invalid level is rejected before any network I/O
+    assert c.post("/api/llm/providers/p1/test",
+                  params={"effort": "sideways"}).status_code == 400
 
 
 def test_route_without_model_leaves_the_choice_to_the_backend(tmp_path, monkeypatch):
@@ -113,7 +137,7 @@ def test_route_without_model_leaves_the_choice_to_the_backend(tmp_path, monkeypa
     llm_admin.upsert_provider(cfg, PROVIDER)
     calls: list[tuple] = []
 
-    def fake(p, m=None, timeout=60.0):
+    def fake(p, m=None, effort=None, timeout=60.0):
         calls.append((p["id"], m))
         return {"ok": True, "model": m or "", "sample": ""}
 
@@ -126,5 +150,34 @@ def test_route_without_model_leaves_the_choice_to_the_backend(tmp_path, monkeypa
 def test_unknown_provider_is_404(tmp_path, monkeypatch):
     c, _ = _app(tmp_path)
     monkeypatch.setattr(llm_admin, "test_provider",
-                        lambda p, m=None, timeout=60.0: {"ok": True})
+                        lambda p, m=None, effort=None, timeout=60.0: {"ok": True})
     assert c.post("/api/llm/providers/nope/test").status_code == 404
+
+
+# ------------------------------------------------ thinking reaches the relay
+
+_ANTHROPIC_OK = {"content": [{"type": "text", "text": "pong"}]}
+
+
+def test_ping_carries_the_thinking_parameter(monkeypatch):
+    """The test ping goes through the same builder as real jobs: with an
+    effort set, an anthropic-format relay must actually SEE the thinking
+    parameter (output_config on adaptive-era models, budget block on
+    legacy ones) -- before, the ping was a bare payload and the relay's
+    thinking column stayed blank no matter what the UI said."""
+    seen = _capture(monkeypatch, _ANTHROPIC_OK)
+    provider = dict(PROVIDER, protocol="anthropic",
+                    base_url="https://relay.example/anthropic",
+                    models=[{"id": "claude-opus-4-8", "max_output": 64000}])
+    llm_admin.test_provider(provider, "claude-opus-4-8", "max")
+    assert seen["payload"]["output_config"] == {"effort": "max"}
+    assert "temperature" not in seen["payload"]
+
+    seen = _capture(monkeypatch, _ANTHROPIC_OK)
+    provider = dict(PROVIDER, protocol="anthropic",
+                    base_url="https://relay.example/anthropic",
+                    models=[{"id": "claude-opus-4-1", "max_output": 64000}])
+    llm_admin.test_provider(provider, "claude-opus-4-1", "low")
+    thinking = seen["payload"]["thinking"]
+    assert thinking["type"] == "enabled" and thinking["budget_tokens"] >= 1024
+    assert thinking["budget_tokens"] < seen["payload"]["max_tokens"]

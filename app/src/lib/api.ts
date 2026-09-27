@@ -65,16 +65,17 @@ export interface SystemInfo {
 
 /** provider preset shape served by GET /api/llm/presets */
 export type LlmPreset = {
-  name: string; protocol: string; base_url: string; auth_style: string;
+  name: string; protocol: string; auth_style: string;
   /** chip text, when it has to differ from `name`. The protocol-agnostic
    *  "custom" preset is the case in point: its stored name mentions OpenAI
    *  compatibility, but its button must not -- the user may pick any of the
    *  three API formats right below it. */
   label?: string;
-  /** default endpoint for a NON-default protocol, so the add-provider
-   *  card can retarget the URL when the user switches API format
-   *  (only presets that actually serve that format define one) */
-  alt_base_urls?: Record<string, string>;
+  /** default endpoint per API format. The KEYS are exactly the formats the
+   *  vendor actually serves -- the add-provider card offers nothing else
+   *  (custom offers all three, with empty URLs to type into). `protocol`
+   *  names the initially selected one. */
+  urls: Record<string, string>;
 };
 
 /* ------------------------------------------------------- warm cache (SWR)
@@ -401,8 +402,13 @@ export async function llmApplyDiscovery(id: string, models: ModelMeta[]): Promis
   if (!r.ok) throw new Error(await errText(r));
 }
 
-export async function llmTest(id: string, model?: string): Promise<{ ok: boolean; model: string; sample: string }> {
-  const q = model ? `?model=${encodeURIComponent(model)}` : "";
+export async function llmTest(
+  id: string, model?: string, effort?: string,
+): Promise<{ ok: boolean; model: string; sample: string }> {
+  const p = new URLSearchParams();
+  if (model) p.set('model', model);
+  if (effort) p.set('effort', effort);
+  const q = p.size ? `?${p}` : '';
   const r = await fetch(`${API_BASE}/api/llm/providers/${id}/test${q}`, { method: "POST" });
   if (!r.ok) throw new Error(await errText(r));
   return r.json();

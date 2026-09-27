@@ -363,10 +363,15 @@ def create_app(cfg: Config) -> FastAPI:
         return {"ok": True, "count": len(provider["models"])}
 
     @app.post("/api/llm/providers/{pid}/test")
-    def llm_test(pid: str, model: str | None = None) -> dict:
+    def llm_test(pid: str, model: str | None = None,
+                 effort: str | None = None) -> dict:
+        # effort: test the request shape the ACTIVE endpoint would send
+        # (thinking/effort parameters included) instead of a bare ping
+        if effort and effort not in llm_admin.EFFORT_LEVELS:
+            raise HTTPException(400, "bad effort level")
         provider = _provider_or_404(pid, unmask=True)
         try:
-            return llm_admin.test_provider(provider, model)
+            return llm_admin.test_provider(provider, model, effort)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, str(e)) from e
 

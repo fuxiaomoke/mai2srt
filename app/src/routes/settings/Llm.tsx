@@ -208,27 +208,24 @@ function AddProviderCard({
   function pickPreset(id: string) {
     setPresetId(id);
     const p = presets[id];
-    if (p) {
-      setName(p.name);
-      setBaseUrl(p.base_url);
-      setProtocol((p.protocol as typeof protocol) ?? 'openai');
-    }
+    if (!p) return;
+    setName(p.name);
+    const proto = ((p.protocol in (p.urls ?? {})) ? p.protocol : 'openai') as typeof protocol;
+    setProtocol(proto);
+    setBaseUrl(p.urls?.[proto] ?? '');
   }
 
   /** switch API format: while the URL still holds one of this preset's
-   *  default endpoints it follows the format switch (OpenRouter openai
-   *  https://openrouter.ai/api/v1 <-> anthropic https://openrouter.ai/api;
-   *  DeepSeek likewise). A hand-typed URL is never clobbered. */
+   *  default endpoints it follows the format switch (e.g. DeepSeek openai
+   *  https://api.deepseek.com <-> anthropic .../anthropic; OpenRouter and
+   *  Ollama likewise). A hand-typed URL is never clobbered. */
   function pickProtocol(p: 'openai' | 'anthropic' | 'gemini') {
-    const preset = presets[presetId];
-    if (preset) {
-      const defaults: Record<string, string> = {
-        [preset.protocol]: preset.base_url,
-        ...preset.alt_base_urls,
-      };
-      if (Object.values(defaults).includes(baseUrl)) {
+    const defaults = presets[presetId]?.urls;
+    if (defaults) {
+      const values = Object.values(defaults);
+      if (values.includes(baseUrl)) {
         const next = defaults[p];
-        if (next && next !== baseUrl) setBaseUrl(next);
+        if (next !== undefined && next !== baseUrl) setBaseUrl(next);
       }
     }
     setProtocol(p);
@@ -236,10 +233,16 @@ function AddProviderCard({
 
   async function save() {
     const preset = presets[presetId];
+    // auth style follows the PROTOCOL, not the preset: switching a preset
+    // to a non-default format (e.g. Gemini's openai-compat) must not carry
+    // the preset's native style over -- a query-key openai discovery sends
+    // no Authorization header and gets 401'd. Ollama is the one openai
+    // endpoint with no auth at all.
     const authStyle =
       protocol === 'anthropic' ? 'x-api-key'
       : protocol === 'gemini' ? 'query-key'
-      : (preset?.auth_style ?? 'bearer');
+      : preset?.auth_style === 'none' ? 'none'
+      : 'bearer';
     try {
       await llmSaveProvider({
         id: presetId === 'custom' ? undefined : presetId,
@@ -274,10 +277,16 @@ function AddProviderCard({
           </button>
         ))}
       </div>
-      {/* API protocol (three formats; presets preselect, custom is free) */}
+      {/* API protocol: a preset offers only the formats its vendor actually
+          serves (DeepSeek/OpenRouter/Ollama: openai+anthropic; OpenAI:
+          openai only; Anthropic: anthropic only; Gemini: native+openai);
+          custom offers all three. */}
       <div className="flex items-center gap-3">
         <span className="text-[12px] font-medium text-ink-2">API</span>
-        {(['openai', 'anthropic', 'gemini'] as const).map((p) => (
+        {((Object.keys(presets[presetId]?.urls ?? {}).length
+          ? Object.keys(presets[presetId]!.urls)
+          : ['openai', 'anthropic', 'gemini']
+        ) as typeof protocol[]).map((p) => (
           <button
             key={p}
             onClick={() => pickProtocol(p)}
@@ -341,16 +350,20 @@ function ProviderCard({
   const testTarget = activeModel ?? provider.models[0]?.id ?? '';
 
   /** model given  -> that row's model only (row button)
-   *  model omitted -> the card's target: active model, else first listed */
+   *  model omitted -> the card's target: active model, else first listed
+   *  The active provider's test carries the active EFFORT too, so the ping
+   *  exercises the exact request shape (thinking params included) a job
+   *  will send -- the reliable way to see the param arrive relay-side. */
   async function test(model?: string) {
     const target = model ?? testTarget;
     if (!target) {
       toast('warn', t('s.toast.testNoModel'));
       return;
     }
+    const effort = isActive ? (active?.effort ?? undefined) : undefined;
     if (model) setTesting(model); else setBusy('test');
     try {
-      const r = await llmTest(provider.id, target);
+      const r = await llmTest(provider.id, target, effort);
       toast('ok', tf('s.toast.testOk', { name: provider.name, model: r.model }));
     } catch (e) {
       toast('error', `${provider.name}: ${String(e).slice(0, 140)}`);
