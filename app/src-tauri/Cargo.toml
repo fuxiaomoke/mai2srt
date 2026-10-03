@@ -1,6 +1,6 @@
 [package]
 name = "mai2srt"
-version = "0.1.2"
+version = "0.1.3"
 description = "mai2srt - MAI-Transcribe to SRT"
 license = "GPL-3.0-only"
 edition = "2021"

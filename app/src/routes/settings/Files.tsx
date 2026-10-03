@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Compass, Eraser, LogIn, Plus, UserRound,
+  Compass, Eraser, LogIn, Plus, ShieldCheck, UserRound,
 } from 'lucide-react';
 import {
   Button, Card, Select, StatusDot, Toggle, useToast,
@@ -27,6 +27,10 @@ export function FilesSettings() {
   const [ready, setReady] = useState(() => warmSystem() !== null && warmSession() !== null);
   const [newAccount, setNewAccount] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
+  const [consentBusy, setConsentBusy] = useState(false);
+  /** set by a sign-in that found the account behind the 451 biometric
+   *  gate: promotes the consent button to primary until it is accepted */
+  const [consentNeeded, setConsentNeeded] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [confirmForgetFor, setConfirmForgetFor] = useState<string | null>(null);
   const toast = useToast();
@@ -54,13 +58,59 @@ export function FilesSettings() {
       const job = await createJob({ kind: 'login' });
       subscribeJob(job.id, {
         onLog: () => {},
-        onDone: () => { toast('ok', t('s.toast.signinOk')); refresh(); setLoginBusy(false); },
+        onDone: (d) => {
+          // a fresh account usually owes the biometric notice: the login
+          // already checked it server-side -- point here BEFORE the first
+          // transcription discovers the 451 the hard way. Sticky: it must
+          // not vanish on a timer, the user closes it (or accepting does)
+          if (d.consent_needed) {
+            setConsentNeeded(true);
+            toast('warn', t('s.toast.consentNeeded'), {
+              sticky: true,
+              tag: 'consent-needed',
+            });
+          } else {
+            setConsentNeeded(false);
+            toast.dismiss('consent-needed');
+            toast('ok', t('s.toast.signinOk'));
+          }
+          refresh();
+          setLoginBusy(false);
+        },
         onError: (m) => { toast('error', m.slice(0, 160)); setLoginBusy(false); },
         onCancelled: () => setLoginBusy(false),
       });
     } catch (e) {
       toast('error', String(e).slice(0, 160));
       setLoginBusy(false);
+    }
+  }
+
+  /** issue #1: accept the one-time playground biometric notice (BIPA) that
+   *  otherwise hard-fails every audio upload with HTTP 451. Runs through the
+   *  job machinery like signIn; the button is the explicit user action --
+   *  a legal acceptance is never recorded silently on the user's behalf. */
+  async function acceptConsent() {
+    setConsentBusy(true);
+    try {
+      const job = await createJob({ kind: 'consent' });
+      subscribeJob(job.id, {
+        onLog: () => {},
+        onDone: (d) => {
+          const accepted = (d as { accepted?: boolean }).accepted;
+          // the sticky warning has served its purpose once accepted (or
+          // found unnecessary) -- take it down, then confirm with an ok
+          toast.dismiss('consent-needed');
+          toast('ok', t(accepted === false ? 's.toast.consentNone' : 's.toast.consentOk'));
+          setConsentNeeded(false);
+          setConsentBusy(false);
+        },
+        onError: (m) => { toast('error', m.slice(0, 160)); setConsentBusy(false); },
+        onCancelled: () => setConsentBusy(false),
+      });
+    } catch (e) {
+      toast('error', String(e).slice(0, 160));
+      setConsentBusy(false);
     }
   }
 
@@ -134,14 +184,28 @@ export function FilesSettings() {
       {/* accounts + environment: stacked full-width rows (user preference:
           one card per row beats the old two-column split) */}
       <Card className="flex flex-col gap-4 p-5">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <span className="flex items-center gap-2 text-[13px] font-semibold text-ink-1">
             <UserRound size={14} strokeWidth={2} className="text-ink-3" />
             {t('s.accounts')}
           </span>
-          <Button busy={loginBusy} onClick={signIn} disabled={!session?.active}>
-            <LogIn size={14} strokeWidth={2} /> {t('s.account.login')}
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            {/* playground gates audio (biometric data, BIPA) behind a
+                one-time account notice; headless runs never see the site's
+                dialog, so the upload fails with 451 until this is accepted */}
+            <Button
+              busy={consentBusy}
+              onClick={acceptConsent}
+              disabled={!session?.active}
+              variant={consentNeeded ? 'primary' : 'ghost'}
+              title={t('s.account.consent.hint')}
+            >
+              <ShieldCheck size={14} strokeWidth={2} /> {t('s.account.consent')}
+            </Button>
+            <Button busy={loginBusy} onClick={signIn} disabled={!session?.active}>
+              <LogIn size={14} strokeWidth={2} /> {t('s.account.login')}
+            </Button>
+          </div>
         </div>
 
         {/* account cards: click to switch; the active card offers forget */}

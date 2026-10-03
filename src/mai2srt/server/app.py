@@ -57,7 +57,7 @@ class ActiveIn(BaseModel):
 
 
 class RunIn(BaseModel):
-    kind: str                       # run | process | login
+    kind: str                       # run | process | login | consent
     audio_path: str | None = None
     mai_json_path: str | None = None
     use_llm: bool = True
@@ -428,6 +428,14 @@ def create_app(cfg: Config) -> FastAPI:
                 job = await manager.start(
                     "login", "sign in",
                     lambda j: login_flow(cfg, on_log=lambda m: manager.emit(j, "log", {"line": m})))
+            elif body.kind == "consent":
+                # issue #1: the 451 biometric gate is cleared through the
+                # same job machinery as login (mutex, SSE log) -- the user
+                # clicks the settings-page button, exactly like re-login
+                from ..runner import consent_flow
+                job = await manager.start(
+                    "consent", "accept biometric notice",
+                    lambda j: consent_flow(cfg, on_log=lambda m: manager.emit(j, "log", {"line": m})))
             else:
                 raise HTTPException(400, "unknown kind: %s" % body.kind)
         except BusyError as e:

@@ -224,6 +224,12 @@ export interface DoneData {
   // None/absent = LLM off or fully applied; a string = some or all over-limit
   // runs fell back to the deterministic split (quality loss, worth a warning)
   llm_note?: string | null;
+  // login job: the biometric-notice check made in the still-open login
+  // browser (issue #1). consent_needed=true -> the settings-page consent
+  // button should be promoted/highlighted; consent_accepted=true -> the
+  // interactive caller already accepted during login
+  consent_needed?: boolean;
+  consent_accepted?: boolean;
 }
 
 export async function getSystem(): Promise<SystemInfo> {
@@ -255,7 +261,7 @@ export async function preflight(
 }
 
 export async function createJob(body: {
-  kind: "run" | "process" | "login";
+  kind: "run" | "process" | "login" | "consent";
   audio_path?: string;
   mai_json_path?: string;
   use_llm?: boolean;

@@ -44,6 +44,29 @@ class TranscribeError(RuntimeError):
     """One upload attempt failed; message carries the stage + raw body."""
 
 
+class BiometricConsentRequired(TranscribeError):
+    """The account has not accepted the playground biometric notice.
+
+    Raised on the 451 ``biometric-consent-required`` gate (audio counts as
+    biometric data under BIPA): no retry can fix it until the acceptance
+    is recorded server-side. The message tells the user where to accept.
+    """
+
+
+#: the one consent kind mai2srt needs: uploading an audio file
+CONSENT_KIND = "audio-upload"
+
+
+def is_biometric_rejection(msg: str) -> bool:
+    """True when an _upload_once error message is the biometric gate.
+
+    The playground rejects gated audio with HTTP 451 + code
+    ``biometric-consent-required`` in the body; _upload_once embeds the
+    raw body in its TranscribeError, so the code string is the marker.
+    """
+    return "biometric-consent-required" in msg
+
+
 @dataclass
 class UploadResult:
     rich: dict
@@ -188,6 +211,17 @@ async (a) => {
 }
 """
 
+#: one fetch for both consent verbs (issue #1: GET reports whether the
+#: account still owes the biometric notice, POST records the acceptance)
+CONSENT_JS = """
+async (a) => {
+  const r = await fetch(a.url, {method: a.method,
+    headers: {'Content-Type': 'application/json'},
+    body: a.body === null ? undefined : JSON.stringify(a.body)});
+  return {status: r.status, text: (await r.text()).slice(0, 500)};
+}
+"""
+
 
 # --------------------------------------------------------------------------
 # response helpers
@@ -259,6 +293,40 @@ def parse_sse(text: str) -> dict:
                     parts.append(delta["content"])
     out["text"] = "".join(parts)
     return out
+
+
+# --------------------------------------------------------------------------
+# the biometric-consent gate (issue #1)
+# --------------------------------------------------------------------------
+
+async def _consent_fetch(page: Page, method: str, kind: str) -> dict:
+    res = await page.evaluate(CONSENT_JS, {
+        "url": (f"{BASE_URL}/api/biometric-consent?kind={kind}"
+                if method == "GET" else f"{BASE_URL}/api/biometric-consent"),
+        "method": method,
+        "body": None if method == "GET" else {"kind": kind},
+    })
+    status = res.get("status")
+    text = str(res.get("text"))[:500]
+    if status != 200:
+        raise TranscribeError(
+            f"consent {method} HTTP {status}: {text}")
+    try:
+        return json.loads(res.get("text") or "{}")
+    except ValueError:
+        raise TranscribeError(f"consent {method} returned non-JSON: {text}") from None
+
+
+async def consent_status(page: Page, kind: str = CONSENT_KIND) -> dict:
+    """GET /api/biometric-consent -> {"needed":bool,"jurisdiction":...}."""
+    return await _consent_fetch(page, "GET", kind)
+
+
+async def accept_biometric_consent(page: Page, kind: str = CONSENT_KIND) -> dict:
+    """POST /api/biometric-consent — the same call the site's own consent
+    dialog makes. The acceptance lives on the account server-side, so it
+    outlives this page/session and unblocks headless uploads for good."""
+    return await _consent_fetch(page, "POST", kind)
 
 
 # --------------------------------------------------------------------------
@@ -365,11 +433,19 @@ def _fatal_status_codes(msg: str) -> list[int]:
 async def transcribe_file(page: Page, audio: Path, mime: str, *,
                           diarize: bool = True, keep: bool = False,
                           title: str | None = None,
-                          reauth=None) -> UploadResult:
+                          reauth=None, consent=None) -> UploadResult:
     """Upload one prepared file with retries; ``reauth`` is an async callable
-    (usually browser.ensure_auth) invoked when a 401-shaped failure occurs."""
+    (usually browser.ensure_auth) invoked when a 401-shaped failure occurs.
+
+    ``consent`` is an async callable returning True when the user agreed to
+    accept the playground biometric notice. It is asked at most once, when
+    the 451 biometric gate rejects the upload; on True the acceptance is
+    recorded in-page and the upload retried immediately. None/False (or a
+    second 451) raises BiometricConsentRequired with guidance text.
+    """
     title = title or f"mai2srt {time.strftime('%m%d_%H%M%S')}"
     last: Exception | None = None
+    asked_consent = False
     for attempt in range(UPLOAD_ATTEMPTS):
         try:
             return await _upload_once(page, audio, mime,
@@ -379,6 +455,26 @@ async def transcribe_file(page: Page, audio: Path, mime: str, *,
             msg = str(e)
             log.warning("attempt %d/%d failed: %s",
                         attempt + 1, UPLOAD_ATTEMPTS, msg[:300])
+            # the 451 biometric gate FIRST: it is neither retryable nor a
+            # plain fatal 4xx -- the account owes a one-time acceptance,
+            # and only the user can give it (it is a legal notice)
+            if is_biometric_rejection(msg):
+                if consent is not None and not asked_consent:
+                    asked_consent = True
+                    if await consent():
+                        log.info("user accepted the biometric notice; "
+                                 "recording it and retrying immediately")
+                        await accept_biometric_consent(page)
+                        continue
+                raise BiometricConsentRequired(
+                    "playground 要求当前账号先接受一次生物特征通知"
+                    "（音频按生物特征数据处理，BIPA）才能上传：\n"
+                    "  CLI: 重新运行并按提示接受，或先执行 mai2srt consent\n"
+                    "  桌面端: 设置 → 文件与账号 → 「接受生物特征通知」后重试\n"
+                    "(the account must accept the playground biometric "
+                    "notice once before audio uploads: run `mai2srt "
+                    "consent`, or Settings → accept biometric notice in "
+                    "the GUI, then retry)") from e
             # auth failures get their dedicated second chance FIRST --
             # the fatal gate below must never short-circuit a re-login
             if reauth is not None and ("401" in msg or "403" in msg):

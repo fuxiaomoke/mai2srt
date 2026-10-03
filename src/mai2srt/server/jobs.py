@@ -23,7 +23,7 @@ log = logging.getLogger("mai2srt.jobs")
 @dataclass
 class Job:
     id: str
-    kind: str                      # run | process | login
+    kind: str                      # run | process | login | consent
     title: str
     created_at: float = field(default_factory=time.time)
     status: str = "queued"         # queued | running | done | error | cancelled

@@ -271,9 +271,22 @@ export function Select({
 /* ------------------------------------------------------------------ Toast */
 
 type ToastKind = 'ok' | 'warn' | 'error';
-type Toast = { id: number; kind: ToastKind; text: string };
+type Toast = { id: number; kind: ToastKind; text: string; sticky?: boolean; tag?: string };
 
-const ToastCtx = createContext<(kind: ToastKind, text: string) => void>(() => {});
+/** sticky: keep the toast on screen until the user closes it (no 4.2s
+ *  auto-dismiss) — for notices that must not be missed; tag: identity for
+ *  dismiss(tag) / dedup-on-repush. Both optional, both orthogonal. */
+export type ToastOpts = { sticky?: boolean; tag?: string };
+
+/** push(kind, text, opts?) with a dismiss(tag) attached as a function
+ *  property, so the many existing (kind, text) call sites stay unchanged. */
+export type ToastPush = {
+  (kind: ToastKind, text: string, opts?: ToastOpts): void;
+  dismiss: (tag: string) => void;
+};
+
+const noopPush: ToastPush = Object.assign(() => {}, { dismiss: () => {} });
+const ToastCtx = createContext<ToastPush>(noopPush);
 export const useToast = () => useContext(ToastCtx);
 
 const TOAST_STYLE: Record<ToastKind, { icon: ReactNode; color: string }> = {
@@ -284,11 +297,27 @@ const TOAST_STYLE: Record<ToastKind, { icon: ReactNode; color: string }> = {
 
 export function ToastHost({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const push = useCallback((kind: ToastKind, text: string) => {
-    const id = Date.now() + Math.random();
-    setToasts((ts) => [...ts, { id, kind, text }]);
-    setTimeout(() => setToasts((ts) => ts.filter((t) => t.id !== id)), 4200);
-  }, []);
+  const push = useCallback(
+    Object.assign(
+      (kind: ToastKind, text: string, opts?: ToastOpts) => {
+        const id = Date.now() + Math.random();
+        const { sticky, tag } = opts ?? {};
+        setToasts((ts) => [
+          // a re-push with the same tag replaces the stale instance
+          ...(tag ? ts.filter((t) => t.tag !== tag) : ts),
+          { id, kind, text, sticky, tag },
+        ]);
+        if (!sticky) {
+          setTimeout(() => setToasts((ts) => ts.filter((t) => t.id !== id)), 4200);
+        }
+      },
+      {
+        dismiss: (tag: string) =>
+          setToasts((ts) => ts.filter((t) => t.tag !== tag)),
+      },
+    ) as ToastPush,
+    [],
+  );
   return (
     <ToastCtx.Provider value={push}>
       {children}

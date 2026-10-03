@@ -137,7 +137,7 @@ FFmpeg 已随安装包内置，**不需要**自行安装。
 2. 双击运行。首次安装可能出现 Windows SmartScreen 蓝窗提示 → 点「更多信息」→「仍要运行」
 3. 默认装到当前用户目录（`C:\Users\<你>\AppData\Local\mai2srt`），想换地方就在安装向导里改；装完开始菜单中会出现 mai2srt
 
-> [!NOTE] 提示
+> [!NOTE]
 > 安装后第一次启动要等一下：后端进程首次拉起，杀毒软件扫描新文件时会更慢——窗口出现前会先显示一张「启动中」的卡片。之后启动很快。
 
 ---
@@ -224,6 +224,10 @@ GUI 覆盖全部常用场景；CLI 适合写进脚本做自动化——一次一
 mai2srt login
 mai2srt login --account work     # 多账号：--account 后接任意名字，首次使用自动创建；各账号独立会话与浏览器配置，指定名字即切换
 
+# 接受生物特征通知：playground 视音频为生物特征数据（BIPA），账号须先接受一次才能上传。
+# 转录报 HTTP 451 / biometric-consent-required 时运行；新账号 login 后与转录遇到该错误时都会当场询问
+mai2srt consent
+
 # 转录：音频/视频 -> 词级时间戳 JSON（默认输出 <音频名>.mai.json，在源文件旁）
 mai2srt transcribe "abc.wav"
 mai2srt transcribe "abc.wav" --out D:\out\x.mai.json   # 指定输出
@@ -293,6 +297,9 @@ A：音频只上传给 playground 的转录接口（服务条款的约束对象�
 
 **Q：支持多长 / 多大的文件？**
 A：站点原生限制 25 MiB / 60 分钟；超限由本工具自动压缩、按静音点分块处理，实际支持数小时级文件。
+
+**Q：转录报 HTTP 451 / biometric-consent-required？**
+A：playground 把音频视为生物特征数据（BIPA），账号需要先接受一次「生物特征通知」才能上传音频——网页端首次上传会弹同意框，本工具走无头通道看不到它，于是被 451 拒绝。处理方式：**设置 → 文件与账号 → 「接受生物特征通知」**（GUI；新账号登录完成时会自动检测并高亮提示该按钮），或运行 `mai2srt consent`（CLI；新账号登录后与转录遇到该错误时都会当场询问）。接受记录保存在微软账号上，一次生效，之后转录恢复正常。
 
 **Q：安装包报毒？**
 A：未签名的安装包偶尔会被杀软误报，属于常见现象；每个 Release 都附 `SHA256SUMS.txt`，可以校验下载是否完整。

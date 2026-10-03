@@ -1,6 +1,7 @@
-"""mai2srt command line: login / transcribe / process / run.
+"""mai2srt command line: login / consent / transcribe / process / run.
 
     mai2srt login
+    mai2srt consent             # accept the playground biometric notice once
     mai2srt transcribe <audio> [--out out.mai.json]
                         [--keep-conversation] [--include-raw]
     mai2srt process <x.mai.json> [--out out.srt] [--no-llm] [tuning flags]
@@ -66,7 +67,7 @@ async def cmd_login(cfg: Config, account: str | None = None) -> int:
         set_active_account(cfg, name)
         log.info("signing in account '%s'", name)
     try:
-        await login_flow(cfg, on_log=log.info)
+        await login_flow(cfg, on_log=log.info, consent=_consent_prompt)
     except TranscribeError as e:
         log.error("%s", e)
         return 1
@@ -83,13 +84,42 @@ def _resolve_keep(cfg: Config, args: argparse.Namespace) -> bool:
     return not auto_delete_conversation(cfg)
 
 
+async def _consent_prompt() -> bool:
+    """Terminal Y/N when the 451 biometric gate rejects an upload.
+
+    A legal notice is accepted only by an explicit user action: the CLI
+    asks (the website shows the same dialog) instead of silently POSTing
+    the acceptance. Non-interactive stdin (pipes/scripts) declines, so
+    the run ends with the `mai2srt consent` guidance instead of hanging.
+    """
+    if not sys.stdin.isatty():
+        return False
+    print("\nplayground 要求当前账号先接受一次生物特征通知（音频按生物特征数据"
+          "处理，BIPA）后才能上传：\n"
+          "接受后记录保存在账号上，仅此一次。是否现在接受？ [y/N] ",
+          end="", flush=True)
+    answer = await asyncio.to_thread(input)
+    return answer.strip().lower() in ("y", "yes")
+
+
+async def cmd_consent(cfg: Config) -> int:
+    from .runner import consent_flow
+    try:
+        await consent_flow(cfg, on_log=log.info)
+    except TranscribeError as e:
+        log.error("%s", e)
+        return 1
+    return 0
+
+
 async def cmd_transcribe(cfg: Config, args: argparse.Namespace) -> int:
     audio = Path(args.audio)
     doc, stitched = await transcribe_audio(
         cfg, audio,
         keep=_resolve_keep(cfg, args),
         include_raw=args.include_raw,
-        on_log=log.info)
+        on_log=log.info,
+        on_consent=_consent_prompt)
     out_path = Path(args.out) if args.out else audio.with_suffix(".mai.json")
     _write_doc(out_path, doc)
     log.info("wrote %s  (%d words, %d utterances, %.1fs)",
@@ -158,7 +188,8 @@ async def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         include_raw=args.include_raw,
         segment_params=sp, post_params=pp,
         use_llm=not args.no_llm,
-        on_log=log.info)
+        on_log=log.info,
+        on_consent=_consent_prompt)
     log.info("done: %d words -> %d entries (%d dialogue)",
              res.words, res.entries, res.dialogue)
     return 0
@@ -211,6 +242,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="sign into this named account (created if new); "
                          "each account keeps its own cookies + browser profile")
 
+    cp = sub.add_parser(
+        "consent", help="accept the playground biometric notice once "
+                        "(unblocks audio uploads rejected with HTTP 451)")
+
     tp = sub.add_parser("transcribe", help="audio -> <name>.mai.json")
     tp.add_argument("audio")
     tp.add_argument("--out", default=None, help="output json path")
@@ -247,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "login":
         return asyncio.run(cmd_login(cfg, account=args.account))
+    if args.cmd == "consent":
+        return asyncio.run(cmd_consent(cfg))
     if args.cmd == "transcribe":
         try:
             return asyncio.run(cmd_transcribe(cfg, args))

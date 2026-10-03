@@ -21,7 +21,9 @@ from .segment import SegmentParams, segment_transcript
 from .segment.llm import OpenAICompatibleSplitter
 from .srt import to_srt
 from .transcribe import browser
-from .transcribe.client import TranscribeError, transcribe_file
+from .transcribe.client import (
+    BiometricConsentRequired, TranscribeError, transcribe_file,
+)
 from .transcribe.parser import has_word_timestamps, parse_rich
 from .transcribe.stitch import stitch
 
@@ -53,6 +55,9 @@ class RunResult:
 
 StageCb = Callable[[str, str], None]     # (stage, detail)
 LogCb = Callable[[str], None]
+#: async () -> bool, asked when the 451 biometric gate rejects an upload;
+#: True = the user agreed to accept the playground biometric notice
+ConsentCb = Callable[[], object]
 
 
 def _noop_stage(stage: str, detail: str) -> None:
@@ -71,6 +76,7 @@ async def transcribe_audio(
     include_raw: bool = False,
     on_stage: StageCb = _noop_stage,
     on_log: LogCb = _default_log,
+    on_consent: ConsentCb | None = None,
 ) -> tuple[dict, object]:
     """Probe -> prepare -> upload per chunk -> stitch. Returns (doc, stitched)."""
     if not audio.exists():
@@ -109,14 +115,23 @@ async def transcribe_audio(
 
             for i, (upath, offset) in enumerate(pieces):
                 on_stage("upload", "chunk %d/%d" % (i + 1, len(pieces)))
-                res = await transcribe_file(
-                    page, upath, _mime(upath),
-                    diarize=diarize,
-                    keep=keep,
-                    title="mai2srt %s %s" % (audio.stem[:30],
-                                             time.strftime("%m%d_%H%M")),
-                    reauth=lambda: browser.ensure_auth(page, cfg, interactive=False),
-                )
+                try:
+                    res = await transcribe_file(
+                        page, upath, _mime(upath),
+                        diarize=diarize,
+                        keep=keep,
+                        title="mai2srt %s %s" % (audio.stem[:30],
+                                                 time.strftime("%m%d_%H%M")),
+                        reauth=lambda: browser.ensure_auth(page, cfg, interactive=False),
+                        consent=on_consent,
+                    )
+                except BiometricConsentRequired as e:
+                    # the GUI has no prompt here (on_consent is None): the
+                    # error text itself carries the settings-page guidance;
+                    # the log line below makes it visible in the job log too
+                    on_log("需要先接受一次生物特征通知（设置页 → 「接受生物特征通知」，"
+                           "或 CLI: mai2srt consent），然后重试转录")
+                    raise
                 raws.append(res.rich)
                 if res.cleanup_ok is False:
                     # "leave no trace" failed: the promise is user-facing, so
@@ -277,6 +292,7 @@ async def run_full(
     use_llm: bool = True,
     on_stage: StageCb = _noop_stage,
     on_log: LogCb = _default_log,
+    on_consent: ConsentCb | None = None,
 ) -> RunResult:
     """transcribe + segment + postprocess in one shot; writes both artifacts.
 
@@ -286,7 +302,7 @@ async def run_full(
     follow the storage policy."""
     doc, stitched = await transcribe_audio(
         cfg, audio, diarize=diarize, keep=keep, include_raw=include_raw,
-        on_stage=on_stage, on_log=on_log)
+        on_stage=on_stage, on_log=on_log, on_consent=on_consent)
     json_path = json_path or audio.with_suffix(".mai.json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -315,19 +331,92 @@ async def run_full(
         llm_note=llm_note)
 
 
-async def login_flow(cfg: Config, on_log: LogCb = _default_log) -> int:
-    """Interactive browser sign-in; returns the /.auth/me status code.
+async def consent_flow(cfg: Config, on_log: LogCb = _default_log) -> dict:
+    """Accept the playground biometric notice once for the active account.
+
+    Same POST the site's own consent dialog makes (issue #1: audio counts
+    as biometric data under BIPA, and a headless client never sees the
+    dialog -- uploads hard-fail with 451 until the account has accepted).
+    The acceptance is stored server-side, so it survives this session.
+    Idempotent: reports "already accepted" when the account needs nothing.
+    """
+    from playwright.async_api import async_playwright
+    from .transcribe.client import (
+        CONSENT_KIND, accept_biometric_consent, consent_status,
+    )
+    async with async_playwright() as p:
+        ctx = await browser.launch(p, cfg, headless=True)
+        try:
+            page = await browser.open_page(ctx)
+            status = await browser.ensure_auth(page, cfg, interactive=False)
+            if status != 200:
+                on_log("登录失效：请先在设置页重新登录 (session expired; sign in first)")
+                raise TranscribeError("not signed in")
+            st = await consent_status(page, CONSENT_KIND)
+            if not st.get("needed"):
+                on_log("账号无需接受生物特征通知 (no biometric consent needed)")
+                return {"accepted": False, "needed": False, "status": st}
+            on_log("playground 要求接受生物特征通知（音频按生物特征数据处理，"
+                   "辖区 %s）" % st.get("jurisdiction", "?"))
+            res = await accept_biometric_consent(page, CONSENT_KIND)
+            on_log("已接受生物特征通知，上传已解锁 (biometric notice accepted)")
+            return {"accepted": True, "needed": True, "status": res}
+        finally:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def login_flow(cfg: Config, on_log: LogCb = _default_log,
+                     consent: ConsentCb | None = None) -> dict:
+    """Interactive browser sign-in; returns {"status", "consent_needed",
+    "consent_accepted"}.
 
     The visible browser opens DIRECTLY on the Microsoft account picker --
     no playground chat page flash before the login UI. Raises when the
     sign-in does not complete (window closed / timeout) so the UI job
     ends in an error state instead of a false success.
+
+    A fresh account always owes the playground biometric notice (issue
+    #1) and the user is right here with a live session: the still-open
+    login page checks the notice (one GET, no side effects) and, when
+    ``consent`` returns True, accepts it NOW -- instead of letting the
+    first transcription discover the 451. Non-interactive callers pass
+    consent=None and surface "consent_needed" themselves.
     """
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         ctx = await browser.launch(p, cfg, headless=False)
         page = await browser.open_page(ctx, url=browser.login_url("select_account"))
         status = await browser.wait_for_login(page, cfg)
+        consent_needed = False
+        consent_accepted = False
+        if status == 200:
+            try:
+                from .transcribe.client import (
+                    CONSENT_KIND, accept_biometric_consent, consent_status,
+                )
+                st = await consent_status(page, CONSENT_KIND)
+                consent_needed = bool(st.get("needed"))
+                if consent_needed:
+                    on_log("检测到该账号尚未接受生物特征通知（音频按生物特征数据"
+                           "处理，BIPA），首次转录前需要接受一次")
+                    if consent is not None and await consent():
+                        await accept_biometric_consent(page, CONSENT_KIND)
+                        consent_accepted = True
+                        consent_needed = False
+                        on_log("已接受生物特征通知，上传已解锁 "
+                               "(biometric notice accepted)")
+                    elif consent is None:
+                        on_log("先在设置页点「接受生物特征通知」再开始转录 "
+                               "(Settings → accept biometric notice)")
+                else:
+                    on_log("账号无需接受生物特征通知 (no biometric consent needed)")
+            except TranscribeError as e:
+                # the login itself succeeded; a consent hiccup must never
+                # turn that into a failed job
+                on_log("生物特征通知状态查询失败（不影响登录）：%s" % e)
         try:
             await ctx.close()
         except Exception:  # noqa: BLE001
@@ -336,4 +425,5 @@ async def login_flow(cfg: Config, on_log: LogCb = _default_log) -> int:
     if status != 200:
         raise TranscribeError(
             "登录未完成：浏览器窗口被关闭或等待超时 (sign-in not completed)")
-    return status
+    return {"status": status, "consent_needed": consent_needed,
+            "consent_accepted": consent_accepted}

@@ -226,6 +226,11 @@ The GUI covers everyday use; the CLI is for scripting and automation — one fil
 mai2srt login
 mai2srt login --account work     # multiple accounts: --account takes any name, created on first use; each account keeps its own session and browser profile, naming one switches to it
 
+# accept the biometric notice: playground treats audio as biometric data (BIPA) and
+# requires a one-time account acceptance before uploads. Run this when transcription
+# fails with HTTP 451 / biometric-consent-required; a fresh account is asked right after login, and so is an interactive run that hits the error
+mai2srt consent
+
 # transcribe: audio/video -> word-timestamp JSON (default <name>.mai.json next to the source)
 mai2srt transcribe "abc.wav"
 mai2srt transcribe "abc.wav" --out D:\out\x.mai.json   # explicit output path
@@ -295,6 +300,9 @@ A: Audio goes only to the playground transcription endpoint (and its terms of se
 
 **Q: How long or how large a file can it handle?**
 A: The site itself limits uploads to 25 MiB / 60 minutes; anything larger is compressed and split on silence here, so multi-hour material works.
+
+**Q: Transcription fails with HTTP 451 / biometric-consent-required.**
+A: Playground treats audio as biometric data (BIPA) and requires a one-time acceptance of the biometric notice before audio uploads — the website shows a consent dialog on the first upload, but mai2srt drives the API headlessly and never sees it, so the upload is rejected. Fix: click **Settings → Files & accounts → "accept biometric notice"** (GUI; a fresh sign-in checks automatically and highlights the button), or run `mai2srt consent` (CLI; a fresh account is asked right after login, and an interactive run asks when it hits the error). The acceptance is recorded on your Microsoft account, once, and transcription works again.
 
 **Q: My antivirus flags the installer.**
 A: An unsigned installer does get flagged by antivirus heuristics now and then — it is a common thing. Every release ships a `SHA256SUMS.txt` so you can check the download.
