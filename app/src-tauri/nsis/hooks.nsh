@@ -1,5 +1,26 @@
-; mai2srt custom uninstall hooks (loaded by the Tauri NSIS template via
-; bundle.windows.nsis.installerHooks in tauri.conf.json).
+; mai2srt custom install/uninstall hooks (loaded by the Tauri NSIS template
+; via bundle.windows.nsis.installerHooks in tauri.conf.json).
+
+; ---------------------------------------------------------------------------
+; PREINSTALL: start every install from a clean dependency tree.
+;
+; The uninstaller only removes the files listed in ITS own manifest, so
+; anything a previous version (or a hand copy) left behind survives an
+; upgrade. That is not just untidy: a stale package directory shadows the
+; bundled one at import time. On 2026-10-13 an empty _internal\websockets\
+; (a lone speedups*.pyd, no __init__.py) made `import websockets` succeed as
+; a namespace package, uvicorn took its hard-import branch, and the backend
+; could not start at all -- while a clean install of the very same build
+; worked. _internal holds program files only: user data lives in
+; $PROFILE\.mai2srt and $DOCUMENTS\mai2srt and is never touched here.
+; ---------------------------------------------------------------------------
+!macro NSIS_HOOK_PREINSTALL
+  RMDir /r "$INSTDIR\_internal"
+!macroend
+
+; ---------------------------------------------------------------------------
+; PREUNINSTALL: the data prompts (below).
+; ---------------------------------------------------------------------------
 ;
 ; The stock confirm-page checkbox (删除应用程序数据) only clears WebView2
 ; storage (theme/glass/wallpaper preferences) -- it never touches the

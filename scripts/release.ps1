@@ -114,6 +114,47 @@ foreach ($f in @("LICENSE.txt", "README.txt", "SOURCE.txt")) {
     }
 }
 
+# The installer is worthless if the frozen backend cannot start. A dependency
+# can be bundled HALF-way -- its extension present while its Python modules
+# are missing -- and that only ever shows up at import time inside the frozen
+# process, never at build time. So run the staged sidecar once and require
+# /api/system to answer before packaging anything.
+Write-Host "==> [4c/6] sidecar smoke test ..."
+$SmokeExe = Join-Path $StageDir "mai2srt-backend-$Triple.exe"
+if (-not (Test-Path $SmokeExe)) { throw "staged sidecar missing: $SmokeExe" }
+# an ephemeral free port, so a backend already running on this machine
+# (dev server, an installed copy) cannot be mistaken for the built one
+$PortProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$PortProbe.Start()
+$SmokePort = $PortProbe.LocalEndpoint.Port
+$PortProbe.Stop()
+$SmokeHome = Join-Path $env:TEMP ("mai2srt-smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$PreviousHome = $env:MAI2SRT_HOME
+$env:MAI2SRT_HOME = $SmokeHome
+$SmokeProc = Start-Process -FilePath $SmokeExe -ArgumentList "serve", "--port", "$SmokePort" -PassThru
+$SmokeOk = $false
+try {
+    # cold start includes the antivirus scan of a freshly written exe
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Seconds 1
+        if ($SmokeProc.HasExited) { break }
+        try {
+            $resp = Invoke-WebRequest "http://127.0.0.1:$SmokePort/api/system" -UseBasicParsing -TimeoutSec 3
+            if ($resp.StatusCode -eq 200) { $SmokeOk = $true; break }
+        } catch { }
+    }
+} finally {
+    if (-not $SmokeProc.HasExited) { Stop-Process -Id $SmokeProc.Id -Force -ErrorAction SilentlyContinue }
+    $env:MAI2SRT_HOME = $PreviousHome
+    Remove-Item $SmokeHome -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not $SmokeOk) {
+    Write-Host "    backend log tail:" -ForegroundColor Red
+    Get-Content (Join-Path $env:USERPROFILE ".mai2srt\logs\backend.log") -Tail 15 -ErrorAction SilentlyContinue
+    throw "the staged backend never answered /api/system on :$SmokePort -- refusing to package a backend that cannot start"
+}
+Write-Host "    sidecar answered /api/system on :$SmokePort"
+
 Write-Host "==> [5/6] tauri build (frontend + NSIS) ..."
 Push-Location $AppDir
 try {
