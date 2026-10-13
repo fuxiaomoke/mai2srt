@@ -56,6 +56,72 @@ def test_plan_hard_cut_when_no_silence():
     assert plan.pieces == [(0.0, 3480.0), (3480.0, 6960.0), (6960.0, 7000.0)]
 
 
+# --- silence scan / prepare progress (2026-10-13 fixes) -----------------------
+
+def test_detect_silences_skips_video_decode(monkeypatch, tmp_path):
+    """-vn: the silence scan must not decode a video's picture stream --
+    a 69-min video burned 11.5 min here decoding video for nothing."""
+    from mai2srt.media import chunk as chunk_mod
+
+    argv: dict = {}
+
+    class _R:
+        returncode = 0
+        stderr = "silence_end: 12.0 | silence_duration: 1.0"
+
+    def fake_run_tool(cmd, **kw):
+        argv["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(chunk_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr(chunk_mod, "resolve_tool", lambda name: "ffmpeg")
+    ends = chunk_mod.detect_silences(tmp_path / "x.mp4")
+    assert ends == [12.0]
+    assert "-vn" in argv["cmd"]
+
+
+def test_prepare_reports_progress(monkeypatch, tmp_path):
+    """prepare() must narrate the silence scan / plan / encodes: long
+    videos sit in preparation for minutes and a silent UI looked wedged."""
+    from mai2srt.media import chunk as chunk_mod
+    from mai2srt.media.probe import MediaInfo
+
+    monkeypatch.setattr(chunk_mod, "detect_silences", lambda src: [1730.0, 3470.0])
+
+    def fake_cut(src, dst, s, e):
+        dst.write_bytes(b"x" * 2048)
+        return dst
+
+    monkeypatch.setattr(chunk_mod, "cut_chunk", fake_cut)
+
+    info = MediaInfo(duration_s=4000.0, channels=2, sample_rate=44100,
+                     codec="aac", ext="mp4", size_bytes=10**9)
+    lines: list[str] = []
+    out = chunk_mod.prepare(Path("lec.mp4"), info, tmp_path,
+                            on_progress=lines.append)
+
+    # 4000s -> 3 pieces cut at the planted silences (1730s, 3470s)
+    assert [off for _, off in out] == [0.0, 1730.0, 3470.0]
+    assert any("scanning for silence points" in m for m in lines)
+    assert any("planned 3 chunks" in m for m in lines)
+    assert any("encoding chunk 1/3" in m for m in lines)
+    assert any("chunk 3/3 ready" in m for m in lines)
+
+
+def test_prepare_progress_passthrough(monkeypatch, tmp_path):
+    """A file already within limits skips chunking and says so."""
+    from mai2srt.media import chunk as chunk_mod
+    from mai2srt.media.probe import MediaInfo
+
+    info = MediaInfo(duration_s=960.0, channels=2, sample_rate=44100,
+                     codec="mp3", ext="mp3", size_bytes=1024)
+    lines: list[str] = []
+    out = chunk_mod.prepare(Path("s.mp3"), info, tmp_path,
+                            on_progress=lines.append)
+    assert out == [(Path("s.mp3"), 0.0)]
+    assert any("sending as-is" in m for m in lines)
+
+
 # --- SSE parsing -------------------------------------------------------------
 
 def test_parse_sse_rich_and_text():

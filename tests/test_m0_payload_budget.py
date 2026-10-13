@@ -108,12 +108,14 @@ def test_transcribe_file_retries_transient(monkeypatch):
 # --------------------------------------------------------- chunk triggering
 
 def test_chunk_trigger_below_site_duration_limit():
-    # the floor-fit bound sits between the chunk target and the site gate:
-    # audios too long for one floor-bitrate upload must chunk even though
-    # they are still under the 3615s site limit
+    # the duration cap sits between the chunk target and the site gate:
+    # the 2026-10-13 403 incident caps pieces at the diarization-safe
+    # duration, well under the 3615s site limit
     assert CHUNK_TARGET_SECONDS < MAX_SINGLE_UPLOAD_SECONDS < MAX_AUDIO_SECONDS
-    # 3300s: under the site gate, over the floor fit -> 2 pieces
+    # 3300s: over the duration cap -> 2 pieces
     from mai2srt.media.chunk import plan_chunks
     assert len(plan_chunks(3300.0, []).pieces) == 2
-    # 3000s: fits a single upload at the floor -> 1 piece
-    assert len(plan_chunks(3000.0, []).pieces) == 1
+    # 3000s: over the cap too (the old 3000s single-upload target) -> 2 pieces
+    assert len(plan_chunks(3000.0, []).pieces) == 2
+    # exactly the target -> 1 piece
+    assert len(plan_chunks(CHUNK_TARGET_SECONDS, []).pieces) == 1

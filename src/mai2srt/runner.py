@@ -92,7 +92,16 @@ async def transcribe_audio(
     import tempfile
     workdir = Path(tempfile.mkdtemp(prefix="mai2srt_", dir=str(cfg.data_dir)))
     try:
-        pieces = await asyncio.to_thread(prepare, audio, info, workdir)
+        # prepare()'s ffmpeg calls block for minutes on long video; both
+        # callbacks are thread-safe (server jobs emit marshals onto the
+        # loop, CLI logging is thread-safe), so progress can flow from the
+        # to_thread worker directly -- without it the UI sat on a static
+        # "prepare" stage and looked wedged (2026-10-13)
+        def _prep_progress(msg: str) -> None:
+            on_log(msg)
+            on_stage("prepare", msg)
+        pieces = await asyncio.to_thread(prepare, audio, info, workdir,
+                                         _prep_progress)
         on_log("upload plan: %d file(s)" % len(pieces))
     except MediaError as e:
         on_log("media preparation failed: %s" % e)

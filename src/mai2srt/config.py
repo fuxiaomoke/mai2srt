@@ -29,17 +29,24 @@ COMPRESS_TARGET_BYTES = 23 * 1024 * 1024
 MP3_BITRATE_MIN_BPS = 64_000
 MP3_BITRATE_MAX_BPS = 192_000
 
-#: longest audio that fits MAX_UPLOAD_BYTES in ONE upload at the bitrate
-#: floor (25 MiB / 8000 B/s = 3277s) minus a container-overhead margin.
-#: Longer audio must be CHUNKED: chunking used to trigger only past the
-#: 3615s site gate, so ~52-60min files compressed over the limit and
-#: failed every attempt. (Real bug, kept fixed under raw semantics.)
-MAX_SINGLE_UPLOAD_SECONDS = 3100.0
+#: longest audio sent as ONE upload (still under the site's 3615s gate).
+#: 2026-10-13 incident: a 2h lecture split into ~50-min chunks got a
+#: deterministic stream HTTP 403 "The transcription service refused this
+#: request ... configuration problem on our side" on the 50-min pieces
+#: (16-min files transcribed fine on the same account). Public MAI-Transcribe
+#: reports corroborate a diarization-path duration limit: 503s on audio
+#: longer than 32 minutes (Q&A 5994805), ~15-minute failures as HTTP 408
+#: (Q&A 5995065) -- both disappear when native diarization is disabled.
+#: Playground's diarize knob is one-way (sending false still diarizes,
+#: live-verified 2026-09-26), so chunk DURATION is the only lever: cap
+#: pieces at 29 min, one minute under the 32-min report.
+MAX_SINGLE_UPLOAD_SECONDS = 1800.0
 
 #: chunking — chunks never exceed the target (cuts land at/below each
-#: boundary); at the 64 kbps floor 3000s costs ~22.9 MiB raw, inside the
-#: 25 MiB limit with margin.
-CHUNK_TARGET_SECONDS = 3000.0
+#: boundary); at the 64 kbps floor 1740s costs ~13.3 MiB raw, far inside
+#: the 25 MiB limit. 29 min keeps every piece below the 32-minute
+#: diarization failure threshold (see MAX_SINGLE_UPLOAD_SECONDS note).
+CHUNK_TARGET_SECONDS = 1740.0
 SILENCE_NOISE_DB = -40.0
 SILENCE_MIN_S = 0.3
 
