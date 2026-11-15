@@ -187,7 +187,8 @@ def test_job_manager_lifecycle_and_sse():
 
         job = await mgr.start("process", "t", factory)
         events = []
-        async for ev in mgr.stream(job):
+        async for idx, ev in mgr.stream(job):
+            assert idx == len(events)          # indices are positional, 0-based
             events.append(ev["type"])
         assert job.status == "done"
         assert job.result == {"answer": 42}

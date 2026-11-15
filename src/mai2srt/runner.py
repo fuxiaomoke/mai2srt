@@ -9,12 +9,13 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from .config import Config, load_app_config, llm_config_from
 from .media.chunk import prepare
+from .messages import tr
 from .media.probe import MediaError, probe
 from .postprocess import PostprocessParams, process as postprocess
 from .segment import SegmentParams, segment_transcript
@@ -51,6 +52,11 @@ class RunResult:
     #: some or all over-limit runs fell back to the deterministic split (see
     #: build_entries). Surfaced to the UI so a silent quality loss is visible.
     llm_note: str | None = None
+    #: 1-based numbers of the pieces the server reported as speechless and
+    #: that were therefore skipped (issue #5). Empty = every piece had speech.
+    #: Surfaced so the UI can explain the missing stretch instead of leaving
+    #: the user wondering why nothing came out of it.
+    silent_chunks: list[int] = field(default_factory=list)
 
 
 StageCb = Callable[[str, str], None]     # (stage, detail)
@@ -68,6 +74,91 @@ def _default_log(msg: str) -> None:
     log.info("%s", msg)
 
 
+async def _upload_pieces(page, pieces, *, audio: Path, diarize: bool,
+                         keep: bool, on_stage: StageCb, on_log: LogCb,
+                         reauth=None, on_consent=None, lang: str = "zh",
+                         ) -> tuple[list, list, list[int]]:
+    """Upload every prepared piece; returns (parts, raws, silent 1-based no.s).
+
+    A piece the server reports as speechless is NOT a failure (issue #5): it
+    contributes an empty transcript so its offset stays in the timeline, the
+    run continues with the remaining pieces, and its number is returned so the
+    caller can tell the user which stretch was skipped. Any OTHER empty
+    transcription still aborts -- that is a protocol regression, not silence.
+    """
+    parts: list = []
+    raws: list = []
+    silent: list[int] = []
+    for i, (upath, offset) in enumerate(pieces):
+        on_stage("upload", "chunk %d/%d" % (i + 1, len(pieces)))
+        try:
+            res = await transcribe_file(
+                page, upath, _mime(upath),
+                diarize=diarize,
+                keep=keep,
+                title="mai2srt %s %s" % (audio.stem[:30],
+                                         time.strftime("%m%d_%H%M")),
+                reauth=reauth,
+                consent=on_consent,
+            )
+        except BiometricConsentRequired:
+            # the GUI has no prompt here (on_consent is None): the
+            # error text itself carries the settings-page guidance;
+            # the log line below makes it visible in the job log too
+            on_log(tr(lang, "run.consent_needed"))
+            raise
+        raws.append(res.rich)
+        if res.cleanup_ok is False:
+            # "leave no trace" failed: the promise is user-facing, so
+            # the failure must be too (file-log-only is not enough)
+            on_log(tr(lang, "run.cleanup_failed"))
+        on_stage("transcribe", "chunk %d" % (i + 1))
+        t = parse_rich(res.rich)
+        if res.no_speech:
+            silent.append(i + 1)
+            on_log(tr(lang, "run.chunk_silent", i=i + 1, n=len(pieces)))
+        elif not has_word_timestamps(t):
+            on_log(tr(lang, "run.chunk_no_words", i=i))
+            raise TranscribeError(f"chunk {i}: no word timestamps",
+                                  code="err.no_timestamps", i=i)
+        parts.append((t, offset, upath.name))
+        if not res.no_speech:
+            on_log(tr(lang, "run.chunk_done", i=i + 1, n=len(pieces),
+                      utts=len(t.utterances), words=len(t.words)))
+    return parts, raws, silent
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Write an artifact, turning an unwritable target into a readable error.
+
+    A locked or read-only output (OneDrive sync, a protected folder) is a
+    normal user mistake, and "[Errno 13] Permission denied" in the error box
+    does not say which file. The technical message still travels as the
+    exception's own text, for the log."""
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        raise TranscribeError(f"cannot write {path}: {e}",
+                              code="err.file_write", path=path) from e
+
+
+def _require_speech(stitched, on_log: LogCb, lang: str = "zh") -> None:
+    """Fail loudly when the whole file was speechless.
+
+    Every piece came back "no speech": there is no subtitle to produce. Writing
+    an empty .srt (or a 0-word .mai.json) would look like a success while
+    delivering nothing, so name the real situation instead (issue #5).
+
+    prepare() catches the no-signal case before uploading anything; this is the
+    backstop for material that only the server could judge (music, say).
+    """
+    if stitched.transcript.words:
+        return
+    msg = tr(lang, "run.no_speech")
+    on_log(msg)
+    raise TranscribeError(msg)
+
+
 async def transcribe_audio(
     cfg: Config,
     audio: Path,
@@ -77,17 +168,22 @@ async def transcribe_audio(
     on_stage: StageCb = _noop_stage,
     on_log: LogCb = _default_log,
     on_consent: ConsentCb | None = None,
-) -> tuple[dict, object]:
-    """Probe -> prepare -> upload per chunk -> stitch. Returns (doc, stitched)."""
+) -> tuple[dict, object, list[int]]:
+    """Probe -> prepare -> upload per chunk -> stitch.
+
+    Returns (doc, stitched, silent_chunks).
+    """
+    lang = cfg.lang
     if not audio.exists():
-        raise TranscribeError(f"audio not found: {audio}")
+        raise TranscribeError(f"audio not found: {audio}",
+                              code="err.audio_missing", path=audio)
     on_stage("prepare", audio.name)
     # ffprobe/ffmpeg are blocking subprocesses: offloading keeps the server
     # event loop alive so SSE progress reaches the UI DURING preparation
     info = await asyncio.to_thread(probe, audio)
-    on_log("source: %s  %.1fs  %dch  %s  %.1f MiB" % (
-        audio.name, info.duration_s, info.channels, info.codec,
-        info.size_bytes / 1024 / 1024))
+    on_log(tr(lang, "run.source", name=audio.name, dur=info.duration_s,
+              ch=info.channels, codec=info.codec,
+              size=info.size_bytes / 1024 / 1024))
 
     import tempfile
     workdir = Path(tempfile.mkdtemp(prefix="mai2srt_", dir=str(cfg.data_dir)))
@@ -101,15 +197,15 @@ async def transcribe_audio(
             on_log(msg)
             on_stage("prepare", msg)
         pieces = await asyncio.to_thread(prepare, audio, info, workdir,
-                                         _prep_progress)
-        on_log("upload plan: %d file(s)" % len(pieces))
+                                         _prep_progress, lang)
+        on_log(tr(lang, "run.upload_plan", n=len(pieces)))
     except MediaError as e:
-        on_log("media preparation failed: %s" % e)
+        on_log(tr(lang, "run.prep_failed", err=e))
         raise
 
-    import time
-    parts = []
-    raws = []
+    parts: list = []
+    raws: list = []
+    silent: list[int] = []
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
@@ -119,53 +215,29 @@ async def transcribe_audio(
             page = await browser.open_page(ctx)
             status = await browser.ensure_auth(page, cfg, interactive=False)
             if status != 200:
-                on_log("登录失效：请先在设置页重新登录 (session expired; sign in first)")
-                raise TranscribeError("not signed in")
-
-            for i, (upath, offset) in enumerate(pieces):
-                on_stage("upload", "chunk %d/%d" % (i + 1, len(pieces)))
-                try:
-                    res = await transcribe_file(
-                        page, upath, _mime(upath),
-                        diarize=diarize,
-                        keep=keep,
-                        title="mai2srt %s %s" % (audio.stem[:30],
-                                                 time.strftime("%m%d_%H%M")),
-                        reauth=lambda: browser.ensure_auth(page, cfg, interactive=False),
-                        consent=on_consent,
-                    )
-                except BiometricConsentRequired as e:
-                    # the GUI has no prompt here (on_consent is None): the
-                    # error text itself carries the settings-page guidance;
-                    # the log line below makes it visible in the job log too
-                    on_log("需要先接受一次生物特征通知（设置页 → 「接受生物特征通知」，"
-                           "或 CLI: mai2srt consent），然后重试转录")
-                    raise
-                raws.append(res.rich)
-                if res.cleanup_ok is False:
-                    # "leave no trace" failed: the promise is user-facing, so
-                    # the failure must be too (file-log-only is not enough)
-                    on_log("会话清理删除失败：该转录记录仍留在 playground 上，"
-                           "可稍后在网页手动删除 (conversation cleanup failed)")
-                on_stage("transcribe", "chunk %d" % (i + 1))
-                t = parse_rich(res.rich)
-                if not has_word_timestamps(t):
-                    on_log("chunk %d returned no word timestamps; aborting" % i)
-                    raise TranscribeError(f"chunk {i}: no word timestamps")
-                parts.append((t, offset, upath.name))
-                on_log("chunk %d done: %d utts / %d words" % (
-                    i, len(t.utterances), len(t.words)))
+                on_log(tr(lang, "run.not_signed_in"))
+                raise TranscribeError("not signed in",
+                                  code="err.not_signed_in")
             try:
-                await ctx.close()
-            except Exception:  # noqa: BLE001
-                pass
+                parts, raws, silent = await _upload_pieces(
+                    page, pieces, audio=audio, diarize=diarize, keep=keep,
+                    on_stage=on_stage, on_log=on_log,
+                    reauth=lambda: browser.ensure_auth(
+                        page, cfg, interactive=False),
+                    on_consent=on_consent, lang=lang)
+            finally:
+                try:
+                    await ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
     finally:
         import shutil
         await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
 
     stitched = stitch(parts, info.duration_s)
+    _require_speech(stitched, on_log, lang)
     doc = build_document(audio, stitched, raws, include_raw)
-    return doc, stitched
+    return doc, stitched, silent
 
 
 def build_document(source: Path, stitched, raws: list, include_raw: bool) -> dict:
@@ -206,7 +278,8 @@ def _mime(path: Path) -> str:
         return "audio/mpeg"
     if ext == "wav":
         return "audio/wav"
-    raise MediaError(f"prepared file has unexpected extension: {path.name}")
+    raise MediaError(f"prepared file has unexpected extension: {path.name}",
+                         code="err.bad_prepared_file", name=path.name)
 
 
 def build_entries(
@@ -240,13 +313,13 @@ def build_entries(
     on_stage("segment", "")
     llm_err: list[str] = []
     segs = segment_transcript(transcript, sp, splitter=splitter, log=on_log,
-                              llm_status=llm_err)
-    on_log("segmented: %d lines" % len(segs))
+                              llm_status=llm_err, lang=cfg.lang)
+    on_log(tr(cfg.lang, "run.segmented", n=len(segs)))
     on_stage("postprocess", "")
     entries = postprocess(segs, pp, audio_duration_s=audio_duration_s,
-                          split_params=sp, log=on_log)
+                          split_params=sp, log=on_log, lang=cfg.lang)
     dial = sum(1 for e in entries if e.is_dialogue)
-    on_log("post-processed: %d entries (%d dialogue)" % (len(entries), dial))
+    on_log(tr(cfg.lang, "run.postprocessed", n=len(entries), dialogue=dial))
     llm_note: str | None = None
     if use_llm:
         if splitter is None:
@@ -281,11 +354,11 @@ def _make_splitter(cfg: Config, on_log: LogCb = _default_log):
     app_config = load_app_config(cfg)
     endpoint = resolve_endpoint(app_config)
     if not endpoint.api_key or not endpoint.model:
-        on_log("no LLM endpoint configured; using deterministic punctuation split")
+        on_log(tr(cfg.lang, "run.llm_missing"))
         return None
-    on_log("LLM split-point selection: %s @ %s (%s, effort=%s)" % (
-        endpoint.model, endpoint.base_url, endpoint.protocol,
-        endpoint.effort or "n/a"))
+    on_log(tr(cfg.lang, "run.llm_active", model=endpoint.model,
+              url=endpoint.base_url, proto=endpoint.protocol,
+              effort=endpoint.effort or "n/a"))
     return ProtocolSplitter(endpoint, log=on_log)
 
 
@@ -309,14 +382,14 @@ async def run_full(
     default; the GUI passes the storage-library path). The .srt ALWAYS
     lands next to the audio -- subtitles follow the media, transcripts
     follow the storage policy."""
-    doc, stitched = await transcribe_audio(
+    doc, stitched, silent_chunks = await transcribe_audio(
         cfg, audio, diarize=diarize, keep=keep, include_raw=include_raw,
         on_stage=on_stage, on_log=on_log, on_consent=on_consent)
     json_path = json_path or audio.with_suffix(".mai.json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(
-        json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-    on_log("wrote %s (%d words)" % (json_path, len(stitched.transcript.words)))
+    _write_text(json_path, json.dumps(doc, ensure_ascii=False, indent=1))
+    on_log(tr(cfg.lang, "run.wrote_json", path=json_path,
+              words=len(stitched.transcript.words)))
 
     # segmentation + LLM split-point calls are blocking (sync HTTP): offload.
     # build_entries (not finish_srt) so the entry structure survives for the
@@ -327,17 +400,17 @@ async def run_full(
     n_dial = sum(1 for e in entries if e.is_dialogue)
     srt = to_srt(entries)
     srt_path = audio.parent / (audio.stem + ".srt")
-    srt_path.write_text(srt, encoding="utf-8")
-    on_log("wrote %s" % srt_path)
+    _write_text(srt_path, srt)
+    on_log(tr(cfg.lang, "run.wrote_srt", path=srt_path))
     if llm_note:
-        on_log("大模型断句未完全生效：%s" % llm_note)
+        on_log(tr(cfg.lang, "run.llm_degraded", err=llm_note))
     return RunResult(
         doc=doc, srt=srt, json_path=json_path, srt_path=srt_path,
         words=len(stitched.transcript.words),
         entries=len(entries), dialogue=n_dial,
         entry_list=entries,
         word_refs=sorted(stitched.transcript.words, key=lambda w: w.start),
-        llm_note=llm_note)
+        llm_note=llm_note, silent_chunks=silent_chunks)
 
 
 async def consent_flow(cfg: Config, on_log: LogCb = _default_log) -> dict:
@@ -359,16 +432,17 @@ async def consent_flow(cfg: Config, on_log: LogCb = _default_log) -> dict:
             page = await browser.open_page(ctx)
             status = await browser.ensure_auth(page, cfg, interactive=False)
             if status != 200:
-                on_log("登录失效：请先在设置页重新登录 (session expired; sign in first)")
-                raise TranscribeError("not signed in")
+                on_log(tr(cfg.lang, "run.not_signed_in"))
+                raise TranscribeError("not signed in",
+                                  code="err.not_signed_in")
             st = await consent_status(page, CONSENT_KIND)
             if not st.get("needed"):
-                on_log("账号无需接受生物特征通知 (no biometric consent needed)")
+                on_log(tr(cfg.lang, "consent.no_need"))
                 return {"accepted": False, "needed": False, "status": st}
-            on_log("playground 要求接受生物特征通知（音频按生物特征数据处理，"
-                   "辖区 %s）" % st.get("jurisdiction", "?"))
+            on_log(tr(cfg.lang, "consent.required",
+                      jurisdiction=st.get("jurisdiction", "?")))
             res = await accept_biometric_consent(page, CONSENT_KIND)
-            on_log("已接受生物特征通知，上传已解锁 (biometric notice accepted)")
+            on_log(tr(cfg.lang, "consent.accepted"))
             return {"accepted": True, "needed": True, "status": res}
         finally:
             try:
@@ -409,30 +483,28 @@ async def login_flow(cfg: Config, on_log: LogCb = _default_log,
                 st = await consent_status(page, CONSENT_KIND)
                 consent_needed = bool(st.get("needed"))
                 if consent_needed:
-                    on_log("检测到该账号尚未接受生物特征通知（音频按生物特征数据"
-                           "处理，BIPA），首次转录前需要接受一次")
+                    on_log(tr(cfg.lang, "login.consent_needed"))
                     if consent is not None and await consent():
                         await accept_biometric_consent(page, CONSENT_KIND)
                         consent_accepted = True
                         consent_needed = False
-                        on_log("已接受生物特征通知，上传已解锁 "
-                               "(biometric notice accepted)")
+                        on_log(tr(cfg.lang, "login.consent_accepted"))
                     elif consent is None:
-                        on_log("先在设置页点「接受生物特征通知」再开始转录 "
-                               "(Settings → accept biometric notice)")
+                        on_log(tr(cfg.lang, "login.consent_hint"))
                 else:
-                    on_log("账号无需接受生物特征通知 (no biometric consent needed)")
+                    on_log(tr(cfg.lang, "consent.no_need"))
             except TranscribeError as e:
                 # the login itself succeeded; a consent hiccup must never
                 # turn that into a failed job
-                on_log("生物特征通知状态查询失败（不影响登录）：%s" % e)
+                on_log(tr(cfg.lang, "login.consent_check_failed", err=e))
         try:
             await ctx.close()
         except Exception:  # noqa: BLE001
             pass
-    on_log("auth status: %s" % status)
+    on_log(tr(cfg.lang, "run.auth_status", status=status))
     if status != 200:
         raise TranscribeError(
-            "登录未完成：浏览器窗口被关闭或等待超时 (sign-in not completed)")
+            "登录未完成：浏览器窗口被关闭或等待超时 (sign-in not completed)",
+            code="err.login_incomplete")
     return {"status": status, "consent_needed": consent_needed,
             "consent_accepted": consent_accepted}

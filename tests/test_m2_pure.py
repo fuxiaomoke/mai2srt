@@ -237,12 +237,16 @@ def test_extract_json_object_tolerant():
         assert "no JSON object" in str(e)
 
 
-def test_split_task_marked_text():
+def test_split_task_keeps_candidates_but_the_request_is_plain_text():
+    """The M6f task shape sends free text; the candidate list stays on the task
+    for diagnostics only (the `[n|`-marked variant was deleted 2026-11-15 --
+    it had been dead since M6f and collided with the pause-marker helper of the
+    same name in segment/llm.py)."""
     words = [W("あ", 0.0, 0.2), W("い", 0.2, 0.4), W("。", 0.4, 0.5), W("う", 0.5, 0.7), W("え", 0.7, 0.9)]
     cands = find_candidates(words, split_pause_s=0.8)
     task = SplitTask(0, words, cands)
-    # only index 2 (。) is a candidate -> numbered 1
-    assert task.marked_text() == "あい。[1|うえ"
+    assert [c.index for c in task.candidates] == [2]      # only the 。
+    assert not hasattr(task, "marked_text")
 
 
 def test_apply_choice_via_fake_splitter():

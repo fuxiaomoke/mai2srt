@@ -41,7 +41,25 @@ CONV_TOKEN = "__MAI2SRT_CONV_ID__"
 
 
 class TranscribeError(RuntimeError):
-    """One upload attempt failed; message carries the stage + raw body."""
+    """One upload attempt failed; message carries the stage + raw body.
+
+    ``str(exc)`` stays the technical English message -- it is what the logs,
+    the detail stream and the retry logic's own classifiers read. A ``code``
+    adds the short human sentence the UI shows instead of a protocol dump
+    (see messages.user_message); a raise site that omits it simply shows the
+    raw message, which beats hiding the reason behind "something failed".
+    """
+
+    def __init__(self, message: str, code: str | None = None,
+                 **params: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
+
+    #: True/False when a conversation was created and cleanup was attempted
+    #: (so the caller can keep the "leave no trace" promise even on the error
+    #: path); None when there was nothing to delete or ``keep`` was requested.
+    cleanup_ok: bool | None = None
 
 
 class BiometricConsentRequired(TranscribeError):
@@ -76,6 +94,11 @@ class UploadResult:
     #: post-transcription conversation delete succeeded / failed. Surfaced
     #: because "leave no trace" is a promise the user must be able to trust.
     cleanup_ok: bool | None = None
+    #: the server answered "No speech was found in this audio" (HTTP 422).
+    #: That is a valid EMPTY transcription of this piece -- not an upload
+    #: failure -- so the caller must not treat the empty ``rich`` as a
+    #: protocol regression (issue #5).
+    no_speech: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -310,11 +333,13 @@ async def _consent_fetch(page: Page, method: str, kind: str) -> dict:
     text = str(res.get("text"))[:500]
     if status != 200:
         raise TranscribeError(
-            f"consent {method} HTTP {status}: {text}")
+            f"consent {method} HTTP {status}: {text}",
+            code="err.consent_http", status=status)
     try:
         return json.loads(res.get("text") or "{}")
     except ValueError:
-        raise TranscribeError(f"consent {method} returned non-JSON: {text}") from None
+        raise TranscribeError(f"consent {method} returned non-JSON: {text}",
+                              code="err.consent_bad_response") from None
 
 
 async def consent_status(page: Page, kind: str = CONSENT_KIND) -> dict:
@@ -348,7 +373,8 @@ async def _upload_once(page: Page, audio: Path, mime: str, *,
             f"audio is %.1f MiB raw, over the %.0f MiB upload limit — "
             "size-budget bug, please report"
             % (len(audio_b64) / 1024 / 1024,
-               MAX_UPLOAD_BYTES / 1024 / 1024))
+               MAX_UPLOAD_BYTES / 1024 / 1024),
+            code="err.upload_too_big", size=len(audio_b64) / 1024 / 1024)
     log.info("uploading %s (%.1f MiB b64, %s)", name,
              len(b64) / 1024 / 1024, mime)
 
@@ -362,58 +388,89 @@ async def _upload_once(page: Page, audio: Path, mime: str, *,
     stage = res1.get("stage")
     create = res1.get("create") or {}
     add = res1.get("add") or {}
-    if stage != "ready":
-        raise TranscribeError(
-            f"stage={stage} create={create.get('status')} "
-            f"create_body={str(create.get('text'))[:200]} "
-            f"add={add.get('status')} add_body={str(add.get('text'))[:300]}")
+    # the conversation can exist even when the add step failed: keep the id
+    # BEFORE the gate so the finally below can delete it either way
     conv_id = res1.get("convId")
-
-    add_json = json.loads(add.get("text") or "{}")
-    d = _deep_find(add_json,
-                   lambda x: "userMessage" in x and "modelMessage" in x)
-    model_msg_id = ((d or {}).get("modelMessage") or {}).get("id") if d else None
-    if not model_msg_id:
-        raise TranscribeError(
-            f"cannot find modelMessage.id in add response: "
-            f"{str(add.get('text'))[:300]}")
-
-    request_id = str(uuid.uuid4())
-    res2 = await page.evaluate(STREAM_JS, {
-        "streamUrl": f"{BASE_URL}/api/chat/stream",
-        "streamBody": _stream_body(conv_id, model_msg_id, diarize),
-        "requestId": request_id,
-        "idleMs": 180_000,
-    })
-    if res2["status"] != 200:
-        raise TranscribeError(
-            f"stream HTTP {res2['status']}: {res2['sse'][:300]}")
-    parsed = parse_sse(res2["sse"])
-    if parsed["rich"] is None:
-        raise TranscribeError(
-            "no rich_transcription in stream "
-            f"(events={parsed['data_events']}, warnings={parsed['warnings']}, "
-            f"text={parsed['text'][:200]})")
-
     cleanup_ok: bool | None = None
-    if not keep:
+    try:
         try:
-            dres = await page.evaluate(DELETE_JS, {
-                "url": f"{TRPC}/conversations.delete?batch=1",
-                "body": _delete_body(conv_id),
+            if stage != "ready":
+                raise TranscribeError(
+                    f"stage={stage} create={create.get('status')} "
+                    f"create_body={str(create.get('text'))[:200]} "
+                    f"add={add.get('status')} add_body={str(add.get('text'))[:300]}",
+                    code="err.upload_step_failed",
+                    status=add.get("status") or create.get("status"))
+
+            add_json = json.loads(add.get("text") or "{}")
+            d = _deep_find(add_json,
+                           lambda x: "userMessage" in x and "modelMessage" in x)
+            model_msg_id = (((d or {}).get("modelMessage") or {}).get("id")
+                            if d else None)
+            if not model_msg_id:
+                raise TranscribeError(
+                    f"cannot find modelMessage.id in add response: "
+                    f"{str(add.get('text'))[:300]}",
+                    code="err.upload_protocol")
+
+            request_id = str(uuid.uuid4())
+            res2 = await page.evaluate(STREAM_JS, {
+                "streamUrl": f"{BASE_URL}/api/chat/stream",
+                "streamBody": _stream_body(conv_id, model_msg_id, diarize),
+                "requestId": request_id,
+                "idleMs": 180_000,
             })
-            cleanup_ok = dres.get("status") == 200
-            if cleanup_ok:
-                log.info("cleanup delete -> 200 (conversation removed)")
-            else:
-                log.warning("cleanup delete -> %s: %s",
-                            dres.get("status"), str(dres.get("text"))[:200])
-        except Exception as e:  # noqa: BLE001 — cleanup is best effort
-            cleanup_ok = False
-            log.warning("cleanup delete failed (non-fatal): %s", e)
+            if res2["status"] != 200:
+                raise TranscribeError(
+                    f"stream HTTP {res2['status']}: {res2['sse'][:300]}",
+                    code="err.stream_failed", status=res2["status"])
+            parsed = parse_sse(res2["sse"])
+            if parsed["rich"] is None:
+                raise TranscribeError(
+                    "no rich_transcription in stream "
+                    f"(events={parsed['data_events']}, "
+                    f"warnings={parsed['warnings']}, "
+                    f"text={parsed['text'][:200]})",
+                    code="err.stream_protocol")
+        finally:
+            # ALWAYS delete: a failure after conversations.create (the 422 of
+            # issue #5 did exactly this) used to skip the delete and leave an
+            # orphan conversation on the account, breaking "leave no trace"
+            cleanup_ok = await _cleanup_conversation(page, conv_id, keep)
+    except TranscribeError as e:
+        e.cleanup_ok = cleanup_ok
+        raise
 
     return UploadResult(rich=parsed["rich"], conversation_id=conv_id,
                         request_id=parsed["request_id"], cleanup_ok=cleanup_ok)
+
+
+async def _cleanup_conversation(page: Page, conv_id: str | None,
+                                keep: bool) -> bool | None:
+    """Delete the conversation this upload created ("leave no trace").
+
+    Returns None when nothing was created or ``keep`` asked to retain it,
+    True/False otherwise. Best effort by design: a cleanup failure is logged
+    and reported, never raised -- losing the transcript over it would be worse
+    than the leftover record.
+    """
+    if keep or not conv_id:
+        return None
+    try:
+        dres = await page.evaluate(DELETE_JS, {
+            "url": f"{TRPC}/conversations.delete?batch=1",
+            "body": _delete_body(conv_id),
+        })
+        ok = dres.get("status") == 200
+        if ok:
+            log.info("cleanup delete -> 200 (conversation removed)")
+        else:
+            log.warning("cleanup delete -> %s: %s",
+                        dres.get("status"), str(dres.get("text"))[:200])
+        return ok
+    except Exception as e:  # noqa: BLE001 — cleanup is best effort
+        log.warning("cleanup delete failed (non-fatal): %s", e)
+        return False
 
 
 #: 4xx codes worth another attempt: auth (reauth flow handles 401/403 and
@@ -422,12 +479,38 @@ async def _upload_once(page: Page, audio: Path, mime: str, *,
 _RETRYABLE_4XX = {401, 403, 408, 429}
 
 
+def _status_codes(msg: str) -> list[int]:
+    """HTTP codes embedded in an _upload_once error message (the add/create
+    step and the SSE stream step report theirs in different shapes)."""
+    codes = [int(c) for c in re.findall(r"(?:add|create)=(\d{3})", msg)]
+    codes += [int(c) for c in re.findall(r"stream HTTP (\d{3})", msg)]
+    return codes
+
+
 def _fatal_status_codes(msg: str) -> list[int]:
     """HTTP codes embedded in an _upload_once error message that make the
     failure deterministic (retrying just re-sends the same 20+ MiB body)."""
-    codes = [int(c) for c in re.findall(r"(?:add|create)=(\d{3})", msg)]
-    codes += [int(c) for c in re.findall(r"stream HTTP (\d{3})", msg)]
-    return [c for c in codes if 400 <= c < 500 and c not in _RETRYABLE_4XX]
+    return [c for c in _status_codes(msg)
+            if 400 <= c < 500 and c not in _RETRYABLE_4XX]
+
+
+#: the playground's content-level answer to a speechless piece ("No speech
+#: was found in this audio. Check the recording isn't silent, ..."). Matched
+#: on a distinctive fragment of the body, never on the status alone: an
+#: unrelated 422 must keep failing loudly.
+_NO_SPEECH_MARKER = "no speech"
+
+
+def is_no_speech_rejection(msg: str) -> bool:
+    """True when an _upload_once error is the server's "this piece is silent".
+
+    A 422 carries that meaning only together with the body: the audio holds no
+    speech, so the correct transcription is EMPTY. That makes it a result, not
+    a failure -- no retry can conjure words out of silence, and refusing the
+    whole run over it threw away every other piece that transcribed fine
+    (issue #5).
+    """
+    return 422 in _status_codes(msg) and _NO_SPEECH_MARKER in msg.lower()
 
 
 async def transcribe_file(page: Page, audio: Path, mime: str, *,
@@ -442,6 +525,10 @@ async def transcribe_file(page: Page, audio: Path, mime: str, *,
     the 451 biometric gate rejects the upload; on True the acceptance is
     recorded in-page and the upload retried immediately. None/False (or a
     second 451) raises BiometricConsentRequired with guidance text.
+
+    A piece the server reports as speechless is returned as an EMPTY
+    UploadResult (``no_speech``) instead of raising: it is a valid answer
+    about that piece, and the caller keeps the rest of the run (issue #5).
     """
     title = title or f"mai2srt {time.strftime('%m%d_%H%M%S')}"
     last: Exception | None = None
@@ -474,7 +561,18 @@ async def transcribe_file(page: Page, audio: Path, mime: str, *,
                     "(the account must accept the playground biometric "
                     "notice once before audio uploads: run `mai2srt "
                     "consent`, or Settings → accept biometric notice in "
-                    "the GUI, then retry)") from e
+                    "the GUI, then retry)",
+                    code="err.consent_required") from e
+            # a speechless piece is an EMPTY transcription, not a rejection:
+            # retrying cannot turn silence into words, and failing here threw
+            # away every piece that would have transcribed fine (issue #5)
+            if is_no_speech_rejection(msg):
+                log.info("%s contains no speech; treating it as an empty "
+                         "transcript (not retrying)", audio.name)
+                return UploadResult(rich={}, conversation_id="",
+                                    request_id=None,
+                                    cleanup_ok=e.cleanup_ok,
+                                    no_speech=True)
             # auth failures get their dedicated second chance FIRST --
             # the fatal gate below must never short-circuit a re-login
             if reauth is not None and ("401" in msg or "403" in msg):
@@ -488,7 +586,9 @@ async def transcribe_file(page: Page, audio: Path, mime: str, *,
                 # retry -- fail now instead of re-uploading for minutes
                 raise TranscribeError(
                     f"server rejected the upload (HTTP {fatal[0]}), not "
-                    f"retrying: {msg[:400]}") from e
+                    f"retrying: {msg[:400]}",
+                    code="err.upload_rejected", status=fatal[0]) from e
             if attempt < UPLOAD_ATTEMPTS - 1:
                 await asyncio.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
-    raise TranscribeError(f"all {UPLOAD_ATTEMPTS} attempts failed: {last}")
+    raise TranscribeError(f"all {UPLOAD_ATTEMPTS} attempts failed: {last}",
+                          code="err.upload_failed", n=UPLOAD_ATTEMPTS)

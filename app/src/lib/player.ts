@@ -15,6 +15,14 @@
  *     playhead AT the segment end instead of clearing to zero, so the same
  *     line can be replayed with one more click.
  *
+ * Render budget (2026-11-15). The store is one object, so every `set` wakes
+ * every subscriber — and the refine page holds a 400+-row subtitle list.
+ * Pushing the clock at 60 Hz made playback feel slightly janky on a 55-min
+ * file purely from re-rendering that list, so the clock is published at
+ * ~10 Hz and callers select SLICES (usePlayerSelector) instead of the whole
+ * state; React then bails out of any render whose slice did not change.
+ * 100 ms is invisible: the readout is "m:ss" and the slider step is 50 ms.
+ *
  * The audio element is a module-level singleton: leaving and re-entering
  * the refine page must not re-download / re-decode a large file.
  */
@@ -85,16 +93,33 @@ export function usePlayer(): PlayerState {
   return useSyncExternalStore(subscribe, () => state);
 }
 
+/** Subscribe to ONE slice of the player state (primitive return values only:
+ *  React compares the snapshot by identity, so a fresh object would defeat
+ *  the bail-out it exists for). The refine page's 400-row list reads
+ *  `playing` / `follow` / a derived row index this way, leaving the 10 Hz
+ *  clock to the transport card alone. */
+export function usePlayerSelector<T>(select: (s: PlayerState) => T): T {
+  return useSyncExternalStore(subscribe, () => select(state));
+}
+
 /* ----------------------------------------------------------- the element */
 
 let el: HTMLAudioElement | null = null;
 /** the media URL the element holds — survives route unmounts (reload skip) */
 let loadedUrl = '';
 let raf = 0;
+/** last clock bucket pushed into the store (see CLOCK_STEP_MS) */
+let lastBucket = -1;
+
+/** store update granularity for the playing clock, in ms. The element ticks
+ *  at the display rate (60 Hz); publishing that would re-render the subtitle
+ *  list 60x a second for a number that only ever reads "m:ss". */
+const CLOCK_STEP_MS = 100;
 
 function cancelTick(): void {
   cancelAnimationFrame(raf);
   raf = 0;
+  lastBucket = -1;      // the next tick publishes immediately
 }
 
 function tick(): void {
@@ -108,7 +133,11 @@ function tick(): void {
     set({ playing: false, segment: null, currentMs: seg.endMs });
     return;
   }
-  set({ currentMs: ms });
+  const bucket = Math.floor(ms / CLOCK_STEP_MS);
+  if (bucket !== lastBucket) {
+    lastBucket = bucket;
+    set({ currentMs: ms });
+  }
   raf = requestAnimationFrame(tick);
 }
 

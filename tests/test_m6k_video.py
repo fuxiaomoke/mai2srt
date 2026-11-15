@@ -101,20 +101,24 @@ def test_ensure_playable_remuxes_aac_to_m4a(tmp_path):
     assert playback.existing_cache(cfg, v) == out
     # second call hits the cache (same path object, no re-extract)
     assert playback.ensure_playable(cfg, v) == out
-    # audio files pass through untouched
-    a = tmp_path / "song.mp3"
+    # audio the element can seek in accurately passes through untouched
+    # (mp3 does NOT: it is remuxed into an .m4a -- see test_seekable_audio.py)
+    a = tmp_path / "song.m4a"
     a.write_bytes(b"\0" * 64)
     assert playback.ensure_playable(cfg, a) == a
 
 
 def test_ensure_playable_transcodes_undecodable_codec(tmp_path):
     cfg = _cfg(tmp_path)
-    # ac3: Chromium cannot decode it -> mp3 transcode fallback
+    # ac3: Chromium cannot decode it -> aac transcode fallback, in the same
+    # seekable mp4 container (an .mp3 fallback would reintroduce the
+    # approximate-seek bug this cache exists to avoid)
     v = _video_with_audio(tmp_path / "movie", acodec="ac3",
                           container=".mkv")
     assert probe(v).codec == "ac3"
     out = playback.ensure_playable(cfg, v)
-    assert out.suffix == ".mp3"
+    assert out.suffix == ".m4a"
+    assert probe(out).codec == "aac"
 
 
 def test_cache_key_invalidates_on_mtime(tmp_path):

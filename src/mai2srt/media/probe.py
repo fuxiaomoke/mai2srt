@@ -11,7 +11,18 @@ from pathlib import Path
 
 
 class MediaError(RuntimeError):
-    pass
+    """ffmpeg/ffprobe problem.
+
+    ``str(exc)`` stays the technical English message (stderr tails belong in
+    the log). When a ``code`` is given, the UI shows that catalog entry in the
+    user's language instead -- see messages.user_message.
+    """
+
+    def __init__(self, message: str, code: str | None = None,
+                 **params: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
 
 
 #: where a resolved tool came from: the copy that belongs to the app (shipped
@@ -64,7 +75,8 @@ def resolve_tool_ex(name: str) -> tuple[str, str]:
     if not path:
         raise MediaError(
             f"{name} not found; install FFmpeg "
-            "(https://ffmpeg.org) or add it to PATH")
+            "(https://ffmpeg.org) or add it to PATH",
+            code="err.ffmpeg_missing", tool=name)
     return path, SOURCE_PATH
 
 
@@ -125,7 +137,8 @@ def probe(path: str | Path) -> MediaInfo:
         errors="replace", timeout=120,
     )
     if r.returncode != 0:
-        raise MediaError(f"ffprobe failed for {p}: {r.stderr[-300:]}")
+        raise MediaError(f"ffprobe failed for {p}: {r.stderr[-300:]}",
+                         code="err.probe_failed")
     try:
         data = json.loads(r.stdout)
         fmt = data["format"]
@@ -134,7 +147,7 @@ def probe(path: str | Path) -> MediaInfo:
         if audio is None:
             # trackless videos (and non-media files that ffprobe sniffs)
             # used to escape as a bare StopIteration -> 500
-            raise MediaError(f"no audio stream in {p}")
+            raise MediaError(f"no audio stream in {p}", code="err.no_audio_stream")
         return MediaInfo(
             duration_s=float(fmt["duration"]),
             channels=int(audio.get("channels") or 0),
@@ -144,4 +157,5 @@ def probe(path: str | Path) -> MediaInfo:
             size_bytes=p.stat().st_size,
         )
     except (KeyError, ValueError, StopIteration) as e:
-        raise MediaError(f"cannot parse ffprobe output for {p}: {e}") from e
+        raise MediaError(f"cannot parse ffprobe output for {p}: {e}",
+                         code="err.probe_parse") from e

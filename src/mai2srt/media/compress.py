@@ -41,7 +41,8 @@ def encode_mp3(src: Path, dst: Path, bitrate_bps: int,
     r = run_tool(cmd, capture_output=True, text=True,
                  encoding="utf-8", errors="replace", timeout=7200)
     if r.returncode != 0:
-        raise MediaError(f"ffmpeg mp3 encode failed: {r.stderr[-300:]}")
+        raise MediaError(f"ffmpeg mp3 encode failed: {r.stderr[-300:]}",
+                         code="err.encode_failed")
     return dst
 
 
@@ -64,7 +65,8 @@ def compress_for_upload(src: Path, dst: Path, duration_s: float) -> Path:
         raise MediaError(
             f"compressed output still {final / 1024 / 1024:.1f} MiB "
             f"(> {MAX_UPLOAD_BYTES / 1024 / 1024:.0f} MiB) — audio too "
-            "long for a single upload; chunking should have handled this")
+            "long for a single upload; chunking should have handled this",
+            code="err.compress_too_big", size=final / 1024 / 1024)
     log.info("compressed to %s (%.1f MiB, %d bps)",
              dst.name, final / 1024 / 1024, bitrate)
     return dst

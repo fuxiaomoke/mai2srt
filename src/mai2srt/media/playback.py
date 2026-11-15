@@ -6,8 +6,26 @@ a source outside it (a video file, or wma/aiff/...) gets its audio track
 extracted ONCE into an app-data cache; every later open is instant:
   - aac/mp3/opus/vorbis/flac tracks -> -vn -c:a copy remux (lossless,
     IO-bound: seconds for an hour of audio)
-  - anything else (ac3/dts/pcm...)  -> mp3 192k transcode (~50-100x
+  - anything else (ac3/dts/pcm...)  -> aac 192k transcode (~50-100x
     realtime)
+
+SEEKABILITY (2026-11-15). Re-encoding is not the only reason to build a
+cache entry: an MP3 is directly playable but NOT correctly seekable in
+Chromium/WebView2. The file carries no per-sample index, so dragging the
+seek bar makes the element pad the target time into a byte offset from the
+Xing header's 100-entry TOC -- and on a VBR file that estimate is seconds
+off. Measured on a 55-min VBR source by recording the element's own output
+and correlating it against the file: seeking to 10:00 audible at 09:55.7
+(-4.3 s), 40:00 at 39:47.9 (-12.1 s), while currentTime -- what the UI
+shows -- read the requested time. Subtitle Edit is unaffected because it
+scans frames instead of estimating.
+
+The fix is a container swap, not a re-encode: an MP4 sample table plus
+-movflags +faststart turns the same MP3 frames into an exactly seekable
+stream (measured 0.0 s error, 1.1 s to remux an hour, bit-identical audio).
+So `.mp3` / raw `.aac` sources land here too -- via a cache entry named
+.m4a -- even though the element could technically play them as they are.
+
 Cache names hash (resolved path + mtime + size), so a changed source
 naturally invalidates its entry; index.json maps hashes back to source
 paths for the settings-card cache manager. The cache is pure derived
@@ -42,9 +60,21 @@ VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv",
 
 #: audio codecs the element decodes natively -> remux instead of
 #: transcode (target extension must be in DIRECT_PLAY_MIMES and a
-#: container ffmpeg can write via stream copy)
-_COPY_TARGET = {"aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
+#: container ffmpeg can write via stream copy). mp3 goes into the MP4
+#: sample table rather than a raw .mp3 for the seekability reason in the
+#: module docstring; the ffmpeg muxer has to be forced (-f mp4), because
+#: .m4a alone would pick the ipod muxer, which refuses mp3.
+_COPY_TARGET = {"aac": ".m4a", "mp3": ".m4a", "flac": ".flac",
                 "opus": ".opus", "vorbis": ".ogg"}
+
+#: targets that need the MP4 muxer + a front-loaded index (moov first, so
+#: the element can start ranged seeks without fetching the tail)
+_MUX_MP4 = ["-f", "mp4", "-movflags", "+faststart"]
+
+#: directly playable, but Chromium cannot SEEK in them: no sample index
+#: (mp3: Xing TOC estimate, seconds off on VBR; raw ADTS aac: worse).
+#: These are routed through the cache like an unplayable source.
+_NON_SEEKABLE = {".mp3", ".aac"}
 
 
 def is_video(p) -> bool:
@@ -52,8 +82,14 @@ def is_video(p) -> bool:
 
 
 def needs_extraction(p) -> bool:
-    """True when /api/audio cannot serve this file as-is."""
-    return Path(p).suffix.lower() not in DIRECT_PLAY_MIMES
+    """True when /api/audio should serve something other than this file.
+
+    Two reasons: the extension is not directly playable (video, wma/...),
+    or the element can play it but cannot seek in it accurately (_NON_SEEKABLE,
+    replaced by an MP4 container of the same audio).
+    """
+    suffix = Path(p).suffix.lower()
+    return suffix not in DIRECT_PLAY_MIMES or suffix in _NON_SEEKABLE
 
 
 def audio_cache_dir(cfg: Config) -> Path:
@@ -131,17 +167,37 @@ def _index_gc(cfg: Config) -> None:
         _index_save(cfg, idx)
 
 
+def _mux_args(ext: str) -> list[str]:
+    """Muxer flags for a copy target: .m4a needs -f mp4 forced (the ipod
+    muxer rejects mp3) and a front-loaded moov so ranged seeking is cheap."""
+    return list(_MUX_MP4) if ext == ".m4a" else []
+
+
 def ensure_playable(cfg: Config, src) -> Path:
-    """A path /api/audio can serve: playable audio files pass through;
-    anything else gets its track extracted into the cache (remux when
-    the codec allows, mp3 transcode otherwise). Concurrent-safe via
-    part-file + atomic rename."""
+    """A path /api/audio can serve: audio the element plays AND seeks in
+    accurately passes through; everything else gets its track extracted into
+    the cache (remux when the codec allows, aac transcode otherwise).
+    Concurrent-safe via part-file + atomic rename.
+
+    A directly playable source that cannot be probed is served AS-IS rather
+    than refused: a peculiar mp3 (or a stray non-audio file with that
+    extension) is still better played with the old approximate seek than
+    answered with a 415.
+    """
     src = Path(src)
     if not src.is_file():
         raise MediaError(f"not found: {src}")
     if not needs_extraction(src):
         return src
-    info = probe(src)          # raises MediaError on a trackless video
+    direct = src.suffix.lower() in DIRECT_PLAY_MIMES
+    try:
+        info = probe(src)      # raises MediaError on a trackless video
+    except MediaError:
+        if not direct:
+            raise
+        log.info("seek remux skipped, serving %s as-is (unprobeable)",
+                 src.name)
+        return src
     d = audio_cache_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
     key = cache_key(src)
@@ -155,7 +211,8 @@ def ensure_playable(cfg: Config, src) -> Path:
             return dst
         tmp = d / (key + ".part" + ext)
         try:
-            _ffmpeg(["-i", str(src), "-vn", "-c:a", "copy"], tmp)
+            _ffmpeg(["-i", str(src), "-vn", "-c:a", "copy", *_mux_args(ext)],
+                    tmp)
             os.replace(tmp, dst)
             log.info("audio cache (remux %s): %s -> %s",
                      info.codec, src.name, dst.name)
@@ -163,17 +220,17 @@ def ensure_playable(cfg: Config, src) -> Path:
             return dst
         except MediaError:
             tmp.unlink(missing_ok=True)
-            log.info("remux failed for %s (%s); transcoding to mp3",
+            log.info("remux failed for %s (%s); transcoding to aac",
                      src.name, info.codec)
 
-    # 2) universal fallback: mp3 192k
-    dst = d / (key + ".mp3")
+    # 2) universal fallback: aac 192k, still inside the seekable container
+    dst = d / (key + ".m4a")
     if not dst.exists():
-        tmp = d / (key + ".part.mp3")
-        _ffmpeg(["-i", str(src), "-vn", "-c:a", "libmp3lame",
-                 "-b:a", "192k"], tmp)
+        tmp = d / (key + ".part.m4a")
+        _ffmpeg(["-i", str(src), "-vn", "-c:a", "aac", "-b:a", "192k",
+                 *_MUX_MP4], tmp)
         os.replace(tmp, dst)
-        log.info("audio cache (mp3): %s -> %s", src.name, dst.name)
+        log.info("audio cache (aac): %s -> %s", src.name, dst.name)
     _index_note(cfg, key, src)
     return dst
 

@@ -139,6 +139,8 @@ FFmpeg is bundled with the installer — you do **not** need to install it yours
 
 > [!NOTE]
 > The first launch after installing takes a moment: the backend process starts for the first time, and an antivirus scan of the newly written files makes it slower — a "starting" card appears before the window does. Later launches are quick.
+>
+> Upgrading is just another install: the installer clears the previous version's program directory first, so leftover files cannot collide. User data (`~/.mai2srt` and `Documents\mai2srt`) is untouched.
 
 ---
 
@@ -155,6 +157,8 @@ FFmpeg is bundled with the installer — you do **not** need to install it yours
 6. When you are happy, press "save .srt" — it writes `<name>_refined.srt` next to the original audio/video, leaving the earlier `.srt` untouched
 
 If you drop a `.mai.json` instead of media, the button becomes "generate subtitles": transcription is skipped and only the segmentation runs again. That spends no transcription quota and is the right path for tuning.
+
+You can switch to any other page while a transcription is running — the job keeps going in the background, a "transcribing" badge appears in the top-right corner, and the finish is announced wherever you are. Come back and the progress, log and result are still there.
 
 | Shortcut | Action |
 | --- | --- |
@@ -180,6 +184,8 @@ Sign-in sessions, project files and caches all stay on this machine:
 | logs | `~/.mai2srt/logs/` |
 
 Audio is uploaded only to the playground transcription endpoint, and its terms of service apply; Settings has a switch that deletes the playground conversation as soon as a transcription finishes. Everything else stays on this machine.
+
+At startup, and at most once a day after that, the app asks GitHub for the latest version number: one ordinary version query, carrying no audio, transcript, account or usage data. Automatic checks can be turned off in the About card that the version number in the bottom-left corner opens.
 
 Multiple accounts: every account under `~/.mai2srt/accounts/` keeps its own session and browser profile, and you can switch between them in Settings.
 
@@ -260,7 +266,7 @@ There is also `mai2srt serve --port 47613`: the backend the GUI talks to. The ap
 | `--min-duration` / `--min-chars` | 1.2 s / 5 | lower bound (shorter cues get merged; `--min-chars 0` disables) |
 | `--split-pause` | 0.8 s | a pause between words at least this long becomes a candidate break |
 | `--merge-gap` | 0.8 s | the largest gap the merge pass may bridge |
-| `--tolerance` | 0.2 s | how close counts as talking at the same time (used to fold dialogue into one cue) |
+| `--tolerance` | 0.2 s | adjacency tolerance for dialogue: how soon after a line ends the next one may start and still count as the same exchange (MAI marks overlap as an X-Y-X "speaker return") |
 | `--expand` | 0.25 s | timestamps stretched outward a little, so subtitles do not hug the words too tightly |
 
 </details>
@@ -312,6 +318,9 @@ A: No. Subtitles come out without one, split on punctuation and pauses alone; on
 
 **Q: Which model endpoints are supported?**
 A: Three formats work: OpenAI-compatible, Anthropic and Gemini. Point a provider at another format and the address follows automatically — and you can always type any compatible address yourself.
+
+**Q: How do I know there is a newer version?**
+A: The version number in the bottom-left corner opens an About card: the running version, whether a release is available, what changed in it, and a "download" button. A small dot appears next to the version when a release is available; the same card has a manual "check now" button and the switch that turns automatic checks off.
 
 ---
 

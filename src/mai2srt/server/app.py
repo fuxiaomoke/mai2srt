@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +25,7 @@ from ..postprocess import PostprocessParams
 from ..segment import SegmentParams
 from ..media import playback
 from ..media.playback import DIRECT_PLAY_MIMES
+from ..messages import normalize
 from ..storage import paired_edit_path
 from ..transcribe.persist import load_mai_json
 from .. import storage
@@ -62,6 +64,9 @@ class RunIn(BaseModel):
     mai_json_path: str | None = None
     use_llm: bool = True
     params: dict = {}
+    #: interface language for the USER log lines of this job ("zh"/"en").
+    #: The detail log stays English either way; absent = the app default.
+    lang: str | None = None
 
 
 class PreviewIn(BaseModel):
@@ -116,6 +121,15 @@ class BrowserIn(BaseModel):
 
 class RevealIn(BaseModel):
     path: str
+
+
+class UrlIn(BaseModel):
+    url: str
+
+
+class UpdateIn(BaseModel):
+    #: None = "leave it alone"; the card only ever sends a boolean
+    auto: bool | None = None
 
 
 class StorageDirIn(BaseModel):
@@ -412,22 +426,26 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.post("/api/jobs")
     async def create_job(body: RunIn) -> dict:
+        # one job, one language: the copy the user reads follows the interface
+        # language at the moment they clicked, even if they switch mid-run
+        jcfg = replace(cfg, lang=normalize(body.lang or cfg.lang))
         try:
             if body.kind == "run":
                 audio = Path(body.audio_path or "")
                 if not audio.exists():
                     raise HTTPException(400, "audio not found: %s" % audio)
-                job = await manager.start("run", audio.name, lambda j: _run_job(cfg, j, body))
+                job = await manager.start("run", audio.name, lambda j: _run_job(jcfg, j, body), lang=jcfg.lang)
             elif body.kind == "process":
                 src = Path(body.mai_json_path or "")
                 if not src.exists():
                     raise HTTPException(400, "mai.json not found: %s" % src)
-                job = await manager.start("process", src.name, lambda j: _process_job(cfg, j, body))
+                job = await manager.start("process", src.name, lambda j: _process_job(jcfg, j, body), lang=jcfg.lang)
             elif body.kind == "login":
                 from ..runner import login_flow
                 job = await manager.start(
                     "login", "sign in",
-                    lambda j: login_flow(cfg, on_log=lambda m: manager.emit(j, "log", {"line": m})))
+                    lambda j: login_flow(jcfg, on_log=lambda m: manager.emit(j, "log", {"line": m})),
+                    lang=jcfg.lang)
             elif body.kind == "consent":
                 # issue #1: the 451 biometric gate is cleared through the
                 # same job machinery as login (mutex, SSE log) -- the user
@@ -435,7 +453,8 @@ def create_app(cfg: Config) -> FastAPI:
                 from ..runner import consent_flow
                 job = await manager.start(
                     "consent", "accept biometric notice",
-                    lambda j: consent_flow(cfg, on_log=lambda m: manager.emit(j, "log", {"line": m})))
+                    lambda j: consent_flow(jcfg, on_log=lambda m: manager.emit(j, "log", {"line": m})),
+                    lang=jcfg.lang)
             else:
                 raise HTTPException(400, "unknown kind: %s" % body.kind)
         except BusyError as e:
@@ -449,15 +468,30 @@ def create_app(cfg: Config) -> FastAPI:
                           "status": j.status} for j in manager.list()]}
 
     @app.get("/api/jobs/{job_id}/events")
-    async def job_events(job_id: str, from_idx: int = 0):
+    async def job_events(job_id: str, request: Request, from_idx: int = 0):
         job = manager.get(job_id)
         if not job:
             raise HTTPException(404, "job not found")
 
+        # EventSource reconnects on its own after a dropped connection and
+        # replays the last ``id:`` it saw as ``Last-Event-ID``. Ignoring that
+        # header (the pre-store behaviour) made every hiccup restart at
+        # from_idx=0 and the log visibly double; honouring it resumes exactly
+        # where the browser stopped. A malformed header is not worth a 500:
+        # falling back to from_idx is always a valid answer.
+        resume = request.headers.get("last-event-id")
+        if resume:
+            try:
+                from_idx = max(from_idx, int(resume) + 1)
+            except ValueError:
+                pass
+
         async def gen():
-            async for ev in manager.stream(job, from_idx):
-                yield "event: %s\ndata: %s\n\n" % (
-                    ev["type"], json.dumps(ev["data"], ensure_ascii=False))
+            # `id:` per event is what makes the resume above possible at all --
+            # without it the browser has no position to send back.
+            async for idx, ev in manager.stream(job, from_idx):
+                yield "id: %d\nevent: %s\ndata: %s\n\n" % (
+                    idx, ev["type"], json.dumps(ev["data"], ensure_ascii=False))
 
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -467,6 +501,41 @@ def create_app(cfg: Config) -> FastAPI:
     def cancel_job(job_id: str) -> dict:
         if not manager.cancel(job_id):
             raise HTTPException(409, "job not cancellable")
+        return {"ok": True}
+
+    # ------------------------------------------------------------- updates
+
+    @app.get("/api/update")
+    def update_get(force: int = 0) -> dict:
+        """``{current, auto, url, checked_at, latest, error}``.
+
+        Cached for 24 h in the backend, so the shell's startup call and the
+        card's "check now" button can share one policy (see update.py). The
+        call is sync on purpose: FastAPI hands it to the threadpool, and a slow
+        GitHub response must never block the event loop that is streaming a
+        transcription's SSE.
+        """
+        from .. import update
+        return update.check_for_update(cfg, force=bool(force))
+
+    @app.put("/api/update")
+    def update_put(body: UpdateIn) -> dict:
+        from .. import update
+        return update.set_update_settings(cfg, auto=body.auto)
+
+    @app.post("/api/open_url")
+    def open_url(body: UrlIn) -> dict:
+        """Open an http(s) URL in the user's browser (the "去下载" button).
+
+        Server-side for the same reason as /api/reveal: the webview should not
+        be the thing that decides a URL is safe to launch, and this keeps the
+        scheme allowlist in one place.
+        """
+        from .. import update
+        try:
+            update.open_external(body.url)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
         return {"ok": True}
 
     # ---------------------------------------------------------------- files
@@ -526,16 +595,20 @@ def create_app(cfg: Config) -> FastAPI:
         Video / exotic-audio paths are transparently served from the
         EXTRACTION CACHE (the first call performs the extraction; sync
         endpoints run in the threadpool so the event loop stays live).
+        An .mp3 comes back from that cache as a .m4a holding the same
+        frames: the element plays an mp3 fine but cannot SEEK in one
+        accurately (see media/playback.py), and this endpoint is what the
+        media element actually talks to.
         """
         p = Path(path)
+        if not p.is_file():
+            raise HTTPException(404, "audio not found: %s" % p)
         if playback.needs_extraction(p):
             from ..media.probe import MediaError
             try:
                 p = playback.ensure_playable(cfg, p)
             except MediaError as e:
                 raise HTTPException(415, str(e)) from e
-        if not p.is_file():
-            raise HTTPException(404, "audio not found: %s" % p)
         mime = _AUDIO_MIMES.get(p.suffix.lower())
         if mime is None:
             raise HTTPException(415, "unsupported audio type: %s" % p.suffix)
@@ -791,7 +864,11 @@ def create_app(cfg: Config) -> FastAPI:
             asyncio.create_task(_prewarm())
         return {"srt_path": str(res.srt_path), "json_path": str(res.json_path),
                 "words": res.words, "entries": res.entries, "dialogue": res.dialogue,
-                "llm_note": res.llm_note}
+                "llm_note": res.llm_note,
+                # pieces the server reported as speechless (issue #5): the job
+                # succeeded, but a stretch produced no subtitles and the user
+                # must hear about it rather than wonder where it went
+                "silent_chunks": res.silent_chunks}
 
     async def _process_job(cfg: Config, job: Job, body: RunIn) -> dict:
         # load + segment + LLM calls are all blocking: run the whole body off
@@ -804,7 +881,14 @@ def create_app(cfg: Config) -> FastAPI:
         from ..srt import to_srt
         src = Path(body.mai_json_path or "")
         manager.emit(job, "stage", {"stage": "prepare", "detail": src.name})
-        t = load_mai_json(src)
+        try:
+            t = load_mai_json(src)
+        except (ValueError, OSError) as e:
+            # wrong file picked, or a damaged export: say so instead of
+            # surfacing json's own "Expecting value: line 1 column 1"
+            from ..transcribe.client import TranscribeError
+            raise TranscribeError(f"cannot read {src}: {e}",
+                                  code="err.bad_json", path=src) from e
         manager.emit(job, "log", {"line": "loaded %s: %d words" % (src.name, len(t.words))})
         # initial result: <audio stem>.srt next to the AUDIO when it
         # resolves, else next to the json (json stem, .mai stripped)
@@ -924,7 +1008,7 @@ def create_app(cfg: Config) -> FastAPI:
                 is_dialogue=bool(e.get("dialogue")), words=list(ws)))
         subs.sort(key=lambda s: s.start)
         expand_outward(subs, pp, t.duration_s)
-        subs = final_format(subs, pp)
+        subs = final_format(subs, pp, t.duration_s)
         # refined result: <audio stem><suffix>.srt next to the AUDIO, so it
         # coexists with the initial <audio stem>.srt instead of clobbering
         out = storage.srt_target(cfg, src, t.source, refined=True,

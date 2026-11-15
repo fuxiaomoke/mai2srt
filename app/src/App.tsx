@@ -1,13 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  AudioLines, Brain, ChevronDown, FolderOpen, Palette, Settings2, SlidersHorizontal,
+  AudioLines, Brain, ChevronDown, ChevronRight, FolderOpen, Loader2, Palette,
+  Settings2, SlidersHorizontal,
 } from 'lucide-react';
 import { TitleBar } from './components/TitleBar';
-import { ToastHost } from './components/ui';
+import { AboutCard } from './components/AboutCard';
+import { ToastHost, useToast } from './components/ui';
 import { primeWarm, getSystem, warmSystem, withBackendRetry } from './lib/api';
 import { AppearanceProvider, WallpaperLayer, useAppearance } from './lib/appearance';
 import { I18nProvider, useI18n, type Key } from './lib/i18n';
+import { jobBoot, useJobSession } from './lib/jobSession';
+import { updateBoot, useUpdate } from './lib/update';
 import { TranscribePage } from './routes/Transcribe';
 import { RefinePage } from './routes/Refine';
 import { AppearanceSettings } from './routes/settings/Appearance';
@@ -36,7 +40,8 @@ function Shell() {
   // mount the appearance effects once at the shell root (provider applies
   // theme CSS vars + exposes the wallpaper layer data)
   const appearance = useAppearance();
-  const { t } = useI18n();
+  const { t, tf } = useI18n();
+  const toast = useToast();
 
   const go = (p: Page) => {
     if (isSettings(p)) lastSection.current = p;
@@ -46,8 +51,59 @@ function Shell() {
 
   // warm the settings payloads once per launch: pages then seed their
   // state from the cache and paint COMPLETE on their first frame (no
-  // components materializing inside the slide-in)
-  useEffect(() => { primeWarm(); }, []);
+  // components materializing inside the slide-in). jobBoot asks the backend
+  // whether a run survived a webview reload -- see lib/jobSession.ts -- and
+  // updateBoot asks whether a newer release exists (it is fire-and-forget:
+  // nothing on screen waits for it).
+  useEffect(() => { primeWarm(); jobBoot(); updateBoot(); }, []);
+
+  /* Job outcomes are announced HERE, not on the transcribe page.
+   *
+   * The run outlives every page (that is the point of jobSession), so the
+   * "finished" moment frequently happens while the user is in Settings or
+   * Refine -- a toast owned by an unmounted page simply never fires. `seq`
+   * bumps once per terminal transition, so re-attaching to a run that settled
+   * earlier repaints it without re-announcing it.
+   *
+   * cancelled is deliberately silent: the user pressed the button. */
+  const notice = useJobSession((s) => s.notice);
+  const announced = useRef(0);
+  useEffect(() => {
+    if (!notice || notice.seq === announced.current) return;
+    announced.current = notice.seq;
+    if (notice.phase === 'done') {
+      toast('ok', t('t.toast.done'));
+      // a partial LLM failure is a quality loss, not a crash: the run
+      // succeeded, so warn instead of pretending everything used the model
+      if (notice.result?.llm_note) {
+        toast('warn', tf('t.toast.llmDegraded', {
+          err: String(notice.result.llm_note).slice(0, 120),
+        }));
+      }
+      // pieces the server found speechless are skipped, not failed: say
+      // which ones so the gap in the subtitles is not a mystery (issue #5)
+      if (notice.result?.silent_chunks?.length) {
+        toast('warn', tf('t.toast.silentChunks', {
+          n: String(notice.result.silent_chunks.length),
+        }));
+      }
+    } else if (notice.phase === 'error') {
+      toast('error', notice.error.slice(0, 160));
+    }
+  }, [notice]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** the running job's file name, '' when nothing is running. Primitive
+   *  selectors on purpose: the shell would otherwise re-render on every log
+   *  line of a 55-minute run. */
+  const runningFile = useJobSession((s) => (s.phase === 'running' ? s.title : ''));
+  const jobRunning = useJobSession((s) => s.phase === 'running');
+  /** '0.1.5' when a newer release is known, '' otherwise. Primitive, so the
+   *  sidebar does not re-render when the card's error text changes. */
+  const newerVersion = useUpdate((s) => s.latest?.version ?? '');
+
+  // the About card is app chrome: opened from the version button, closed by
+  // Escape, the × or the backdrop
+  const [aboutOpen, setAboutOpen] = useState(false);
 
   // The shell runs inside a webview, whose own shortcuts mean nothing here and
   // surface as browser UI on top of the app: Ctrl+S opens the webview's "save
@@ -205,8 +261,24 @@ function Shell() {
             )}
           </AnimatePresence>
 
-          <div className="mt-auto px-3 pb-1 text-[11px] text-ink-3">
-            {appVer ? `mai2srt v${appVer}` : 'mai2srt'}
+          <div className="mt-auto pb-1">
+            {/* version = app identity, and the door to "is there something
+                newer?". The dot is the whole notification: it must be visible
+                without opening anything, without stealing a toast slot. */}
+            <button
+              onClick={() => setAboutOpen(true)}
+              title={newerVersion
+                ? tf('about.openNew', { v: newerVersion })
+                : t('about.open')}
+              className="flex w-full items-center gap-1.5 rounded-(--radius-s) px-3 py-1 text-left text-[11px] text-ink-3 transition-colors hover:bg-hover hover:text-ink-1"
+            >
+              {newerVersion && (
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+              )}
+              <span className="truncate">
+                {appVer ? `mai2srt v${appVer}` : 'mai2srt'}
+              </span>
+            </button>
           </div>
         </nav>
 
@@ -242,6 +314,56 @@ function Shell() {
           </AnimatePresence>
         </main>
       </div>
+
+      {/* The floating "still transcribing" bookmark.
+       *
+       * It replaces the quiet line that used to sit above the sidebar version
+       * (user feedback 2026-11-16: too easy to miss). It is deliberately
+       * LOUD and OUTSIDE the page flow -- the run is app-level, so its
+       * indicator is too, and the top-right corner is empty on every page.
+       *
+       * Shown exactly while a run is live AND the user is elsewhere: on the
+       * transcribe page the stage timeline already says all of this, and two
+       * indicators for one fact is noise. That also honours the requested
+       * lifetime -- it disappears when the run ends (success OR failure; the
+       * toast reports the outcome) and the moment the user navigates back
+       * while it is still running.
+       *
+       * Motion is x-only: an opacity animation isolates the compositor layer
+       * and breaks backdrop-filter sampling (the documented glass-flash bug),
+       * so the badge slides in from the right at full opacity instead. */}
+      <AnimatePresence>
+        {jobRunning && page !== 'transcribe' && (
+          <motion.button
+            initial={{ x: 18 }}
+            animate={{ x: 0 }}
+            exit={{ x: 18 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            onClick={() => go('transcribe')}
+            title={tf('t.job.runningFile', { name: runningFile })}
+            className="glass-modal fixed right-4 top-[52px] z-30 flex max-w-[330px] items-center gap-2.5 rounded-(--radius-m) border-primary/40 py-2 pl-2.5 pr-3 text-left transition-colors hover:border-primary/70 hover:bg-primary-dim"
+          >
+            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-primary-dim text-primary">
+              <Loader2 size={14} strokeWidth={2.5} className="animate-spin" />
+            </span>
+            <span className="flex min-w-0 flex-col">
+              <span className="text-[12px] font-semibold leading-tight text-primary">
+                {t('nav.jobRunning')}
+              </span>
+              {runningFile && (
+                <span className="truncate font-mono text-[10.5px] leading-tight text-ink-3">
+                  {runningFile}
+                </span>
+              )}
+            </span>
+            <ChevronRight size={14} strokeWidth={2} className="shrink-0 text-ink-3" />
+          </motion.button>
+        )}
+      </AnimatePresence>
+
+      {aboutOpen && (
+        <AboutCard version={appVer} onClose={() => setAboutOpen(false)} />
+      )}
     </div>
   );
 }

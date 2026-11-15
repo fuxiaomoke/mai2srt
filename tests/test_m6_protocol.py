@@ -442,7 +442,9 @@ def test_batching_respects_budget():
     batches = sp._batches(tasks)
     assert len(batches) > 1
     for b in batches:
-        assert sum(len(t.marked_text()) for t in b) <= e.budget_chars() + 1500
+        # the request body is each run's display text ([id=N] scaffolding
+        # excluded), so that is what the char budget has to bound
+        assert sum(len(join_words(t.words)) for t in b) <= e.budget_chars() + 1500
 
 
 # --------------------------------------------------------- legacy interface

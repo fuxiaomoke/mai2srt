@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import tempfile
 import time
@@ -27,6 +28,7 @@ from pathlib import Path
 from . import __version__
 from .config import Config
 from .media.probe import MediaError
+from .messages import normalize, user_message
 from .runner import (
     build_document,
     finish_srt,
@@ -107,19 +109,23 @@ async def cmd_consent(cfg: Config) -> int:
     try:
         await consent_flow(cfg, on_log=log.info)
     except TranscribeError as e:
-        log.error("%s", e)
+        log.error("%s", user_message(e, cfg.lang))
+        log.debug("consent failed: %s", e)
         return 1
     return 0
 
 
 async def cmd_transcribe(cfg: Config, args: argparse.Namespace) -> int:
     audio = Path(args.audio)
-    doc, stitched = await transcribe_audio(
+    doc, stitched, silent = await transcribe_audio(
         cfg, audio,
         keep=_resolve_keep(cfg, args),
         include_raw=args.include_raw,
         on_log=log.info,
         on_consent=_consent_prompt)
+    if silent:
+        log.warning("%d chunk(s) contained no speech and were skipped: %s",
+                    len(silent), ", ".join(str(n) for n in silent))
     out_path = Path(args.out) if args.out else audio.with_suffix(".mai.json")
     _write_doc(out_path, doc)
     log.info("wrote %s  (%d words, %d utterances, %.1fs)",
@@ -161,9 +167,15 @@ def _tuned_params(args: argparse.Namespace) -> tuple:
 def cmd_process(cfg: Config, args: argparse.Namespace) -> int:
     src = Path(args.mai_json)
     if not src.exists():
-        log.error("input not found: %s", src)
+        log.error("%s", user_message(
+            TranscribeError(f"input not found: {src}", code="err.input_missing",
+                            path=src), cfg.lang))
         return 1
-    t = load_mai_json(src)
+    try:
+        t = load_mai_json(src)
+    except (ValueError, OSError) as e:
+        raise TranscribeError(f"cannot read {src}: {e}",
+                              code="err.bad_json", path=src) from e
     if not t.words:
         log.error("no words in %s; re-transcribe the source audio", src)
         return 1
@@ -217,7 +229,9 @@ def _add_tuning(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--merge-gap", type=float, default=0.8,
                     help="max gap s the smart merge may bridge (default 0.8)")
     sp.add_argument("--tolerance", type=float, default=0.2,
-                    help="dialogue clustering tolerance s (default 0.2)")
+                    help="dialogue adjacency tolerance s: how soon after a line "
+                         "ends the next may start and still count as the same "
+                         "exchange (MAI X-Y-X interleave) (default 0.2)")
     sp.add_argument("--expand", type=float, default=0.25,
                     help="timestamp outward expansion s (default 0.25)")
 
@@ -235,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
                     "-> word-timestamp JSON -> segmented/dialogue SRT")
     ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("-v", "--verbose", action="store_true")
+    #: language of the progress lines on stdout (the GUI sends its own per
+    #: job). The technical detail log stays English either way.
+    ap.add_argument("--lang", choices=("zh", "en"), default=None,
+                    help="language of the progress output (default: $MAI2SRT_LANG or zh)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("login", help="open a browser and (re)establish the session")
@@ -277,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--port", type=int, default=47613)
 
     args = ap.parse_args(argv)
-    cfg = Config()
+    cfg = Config(lang=normalize(args.lang or os.environ.get("MAI2SRT_LANG")))
     _setup_logging(cfg, args.verbose)
 
     if args.cmd == "login":
@@ -288,15 +306,24 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return asyncio.run(cmd_transcribe(cfg, args))
         except (TranscribeError, MediaError) as e:
-            log.error("transcription failed: %s", e)
+            # the console gets the same human sentence the GUI shows; -v
+            # additionally prints the technical message via the log below
+            log.error("%s", user_message(e, cfg.lang))
+            log.debug("transcription failed: %s", e)
             return 1
     if args.cmd == "process":
-        return cmd_process(cfg, args)
+        try:
+            return cmd_process(cfg, args)
+        except (TranscribeError, MediaError) as e:
+            log.error("%s", user_message(e, cfg.lang))
+            log.debug("process failed: %s", e)
+            return 1
     if args.cmd == "run":
         try:
             return asyncio.run(cmd_run(cfg, args))
         except (TranscribeError, MediaError) as e:
-            log.error("run failed: %s", e)
+            log.error("%s", user_message(e, cfg.lang))
+            log.debug("run failed: %s", e)
             return 1
     if args.cmd == "serve":
         return cmd_serve(cfg, args)

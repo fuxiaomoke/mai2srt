@@ -163,13 +163,16 @@ def test_preview_audio_resolution_order(tmp_path):
     assert info["override"] is None and info["missing"] is None
     assert info["duration_s"] == 3.2
 
-    # bind a差分音轨 -> override wins
+    # bind a差分音轨 -> override wins. An .mp3 override is PENDING until its
+    # seekable mp4 copy exists (the refine page calls /api/audio/prepare on
+    # load, see test_seekable_audio.py); a .wav would resolve immediately.
     r = c.put("/api/audio_binding",
               json={"mai_json_path": str(src), "audio_path": str(other_audio)})
     assert r.status_code == 200
-    assert r.json()["audio"]["resolved"] == str(other_audio)
+    assert r.json()["audio"]["resolved"] is None
+    assert r.json()["audio"]["pending_path"] == str(other_audio)
     info = _preview(c, src)["audio"]
-    assert info["resolved"] == str(other_audio)
+    assert info["pending"] is True and info["resolved"] is None
     assert info["override"] == str(other_audio)
 
     # override file vanishes -> falls back to the existing source

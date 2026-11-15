@@ -1,17 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  AudioLines, FileAudio, FileJson, FileVideo, FolderOpen, Scissors,
-  SlidersHorizontal, Upload, Wand2,
+  AudioLines, Check, ClipboardCopy, FileAudio, FileJson, FileVideo,
+  FolderOpen, History, RotateCcw, ScrollText, Scissors, SlidersHorizontal,
+  Upload, Wand2, X,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Button, Card, StatusDot, Toggle, useToast } from '../components/ui';
 import { useI18n, type Key } from '../lib/i18n';
 import {
-  cancelJob, createJob, getSubtitleParams, getSystem, preflight, revealPath,
-  subscribeJob, warmParams, warmSystem, withBackendRetry,
-  type DoneData, type PreflightKey, type SubtitleParams, type SystemInfo,
+  getSubtitleParams, getSystem, preflight, revealPath,
+  warmParams, warmSystem, withBackendRetry,
+  type PreflightKey, type SubtitleParams, type SystemInfo,
 } from '../lib/api';
+import {
+  isTerminal, jobBoot, jobCancel, jobDismiss, jobExpand, jobFail, jobLeave,
+  jobMarkSeen, jobPickFile, jobStart, useJobSession,
+} from '../lib/jobSession';
 import { loadUseLlm, storeUseLlm } from '../lib/subtitle';
 
 /** how a missing prerequisite is named in the refusal toast */
@@ -48,39 +53,53 @@ function isVideoPath(p: string): boolean {
   return VIDEO_EXTS.some((e) => p.toLowerCase().endsWith('.' + e));
 }
 
+/** The transcribe page is a VIEW of `jobSession` (see that module's header for
+ *  why the run lives outside the page). Everything that used to be component
+ *  state -- job id, stage, both log streams, result, error, the picked file --
+ *  now comes from the store, so navigating away and back no longer destroys it;
+ *  only genuinely view-local things (the detail toggle, the "copied" flash,
+ *  drag hover) stay here and are expected to reset. */
 export function TranscribePage() {
-  const { t, tf } = useI18n();
+  const { t, tf, lang } = useI18n();
+  const job = useJobSession((s) => s);
   // seeded from the startup warm cache: on a hit the status line and the
   // params card are complete on the first frame (their reserved/invisible
   // slots below cover only the cold-cache case)
   const [sys, setSys] = useState<SystemInfo | null>(warmSystem);
-  const [path, setPath] = useState('');
-  const [isJson, setIsJson] = useState(false);
   // shared with the refine workspace (persisted) so both pages agree
   const [useLlm, setUseLlmState] = useState(loadUseLlm);
   const [params, setParams] = useState<SubtitleParams | null>(warmParams);
-  const [jobId, setJobId] = useState<string | null>(null);
   // true from the click until the job exists: instant feedback even before
   // the createJob roundtrip resolves (the click must never feel dead)
   const [starting, setStarting] = useState(false);
-  const [stage, setStage] = useState('');
-  const [logs, setLogs] = useState<string[]>([]);
-  const [result, setResult] = useState<DoneData | null>(null);
-  const [error, setError] = useState('');
+  const [showDetail, setShowDetail] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const toast = useToast();
   const logRef = useRef<HTMLDivElement>(null);
-  const disposeRef = useRef<(() => void) | null>(null);
 
-  const running = jobId !== null && !result && !error;
+  const running = job.phase === 'running';
   const busy = starting || running;
+  /** a finished run the user has already looked at, seen from a later visit:
+   *  the screen shows the invitation plus one thin "上次…" bar instead of the
+   *  old log wall. Nothing is deleted -- 查看 reopens the exact same screen. */
+  const folded = job.collapsed && isTerminal(job.phase);
+  /** the file the page is about. Folded means "this session is history", so the
+   *  drop zone is empty again -- and `start()` follows the same value, which is
+   *  what keeps an invisible file from being re-transcribed. */
+  const shownPath = folded ? '' : job.path;
+  const shownIsJson = !folded && job.isJson;
 
   const setUseLlm = (v: boolean) => {
     setUseLlmState(v);
     storeUseLlm(v);
   };
 
+  // mount: restore a run this document never saw (webview reload, renderer
+  // crash -- the backend job keeps running through both) and refresh the two
+  // payloads the page paints
   useEffect(() => {
+    jobBoot();
     // retry-wrapped: this page mounts BEFORE the startup prefetch settles, so
     // its own first fetch lands while the packaged sidecar may still be
     // booting. A one-shot fetch then failed once and left the status line and
@@ -93,12 +112,24 @@ export function TranscribePage() {
     withBackendRetry(() => getSubtitleParams())
       .then(({ params: p }) => { if (alive) setParams(p); })
       .catch(() => { /* the status-line toast above already said it */ });
-    return () => { alive = false; disposeRef.current?.(); };
-  }, []);
+    return () => { alive = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // rule 2, first half: a terminal run has been PAINTED, so it has been seen.
+  // Only then may leaving fold it (jobLeave) -- a run that finished while the
+  // page was closed is laid out in full the first time it is opened.
+  useEffect(() => {
+    if (isTerminal(job.phase)) jobMarkSeen();
+  }, [job.phase]);
+
+  // rule 2, second half: folding happens on the way OUT, never on arrival, so
+  // the screen never reflows under the user's eyes. Unmount-safe by
+  // construction: jobLeave reads the live module state, not this render.
+  useEffect(() => () => jobLeave(), []);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [logs]);
+  }, [job.logs, job.detailLogs, showDetail]);
 
   // native drag-drop with absolute paths (tauri)
   useEffect(() => {
@@ -115,10 +146,7 @@ export function TranscribePage() {
               toast('warn', t('t.drop.rejected'));
               return;
             }
-            setIsJson(p.endsWith('.mai.json'));
-            setPath(p);
-            setResult(null);
-            setError('');
+            jobPickFile(p, p.endsWith('.mai.json'));
           },
         );
       } catch { /* plain browser */ }
@@ -129,31 +157,27 @@ export function TranscribePage() {
   async function pick() {
     const p = await open({
       multiple: false,
-      filters: isJson
+      filters: job.isJson
         ? [{ name: 'mai2srt json', extensions: ['json'] }]
         : [
             { name: 'audio', extensions: AUDIO_EXTS },
             { name: 'video', extensions: VIDEO_EXTS },
           ],
     });
-    if (typeof p === 'string') {
-      setPath(p);
-      setResult(null);
-      setError('');
-    }
+    if (typeof p === 'string') jobPickFile(p, p.endsWith('.mai.json'));
   }
 
   async function start() {
-    if (busy) return;
-    // busy FIRST (a double click must not fire two preflights), but the page
-    // state is only cleared once the job is really going to start: a refused
-    // click must not wipe the previous run's result and log
+    if (busy || !shownPath) return;
+    // busy FIRST (a double click must not fire two preflights), but the store
+    // is only reset once the job is really going to start: a refused click
+    // must not wipe the previous run's result and log
     setStarting(true);
     try {
       // refuse up front rather than watch the job die a minute later: the
       // backend names exactly which prerequisite is missing (static check,
       // instant -- an expired session is still caught inside the job)
-      const kind = isJson ? 'process' : 'run';
+      const kind = job.isJson ? 'process' : 'run';
       const pf = await preflight(kind, useLlm).catch(() => null);
       if (pf && !pf.ok) {
         toast('warn', tf('t.toast.missing', {
@@ -161,45 +185,61 @@ export function TranscribePage() {
         }));
         return;
       }
-      setError('');
-      setResult(null);
-      setLogs([]);
-      setStage('');
-      const job = await createJob(
-        isJson
-          ? { kind: 'process', mai_json_path: path, use_llm: useLlm }
-          : { kind: 'run', audio_path: path, use_llm: useLlm },
-      );
-      setJobId(job.id);
-      disposeRef.current = subscribeJob(job.id, {
-        onStage: (s) => setStage(s),
-        onLog: (line) => setLogs((ls) => [...ls.slice(-500), line]),
-        onDone: (d) => {
-          setResult(d);
-          toast('ok', t('t.toast.done'));
-          // a partial LLM failure is a quality loss, not a crash: the run
-          // succeeded, so warn instead of pretending everything used the model
-          if (d.llm_note) {
-            toast('warn', tf('t.toast.llmDegraded', { err: String(d.llm_note).slice(0, 120) }));
-          }
-          getSystem().then(setSys).catch(() => {});
-        },
-        onError: (m) => {
-          setError(m);
-          toast('error', m.slice(0, 160));
-        },
-        onCancelled: () => setError(t('t.toast.cancelled')),
-      });
+      await jobStart(job.isJson
+        ? { kind: 'process', mai_json_path: shownPath, use_llm: useLlm, lang }
+        : { kind: 'run', audio_path: shownPath, use_llm: useLlm, lang });
     } catch (e) {
-      setError(String(e));
+      // stays in the store, not in this component: an error that vanishes
+      // because the user changed pages is the bug this refactor is about
+      jobFail(String(e));
     } finally {
       setStarting(false);
     }
   }
 
-  const stageIdx = STAGES.findIndex((s) => s.id === stage);
-  // center the invitation until real work content appears, then anchor top
-  const engaged = busy || logs.length > 0 || !!result || !!error;
+  // -1 while `starting`: the job does not exist yet, so the store still holds
+  // the PREVIOUS run's stage. Lighting that stage up would claim the new run
+  // had already reached it.
+  const stageIdx = running ? STAGES.findIndex((s) => s.id === job.stage) : -1;
+  // center the invitation until real work content appears, then anchor top.
+  // A folded run is content-free BY DESIGN (the bar is one line), so the page
+  // goes back to looking like a fresh one.
+  const engaged = busy || (!folded
+    && (job.logs.length > 0 || !!job.result || !!job.error
+        || job.phase === 'cancelled'));
+
+  /* One click, one pasteable report: the version/system header a maintainer
+     always has to ask for, plus the diagnostic stream. Falls back to the
+     deprecated execCommand path because a packaged WebView may refuse the
+     clipboard API (no user-gesture permission model there). */
+  async function copyDiagnostics() {
+    const text = [
+      `mai2srt v${sys?.version ?? '?'} · python ${sys?.python ?? '?'}`,
+      `ffmpeg: ${sys?.ffmpeg.found ? (sys.ffmpeg.source ?? 'found') : 'MISSING'}`
+        + ` · browser: ${sys?.chrome.channel ?? 'none'}`,
+      '----------------------------------------',
+      ...(job.detailLogs.length ? job.detailLogs : job.logs),
+    ].join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  }
+
+  /** "上次：a.mp3 · 已完成 · 467 条字幕" -- the one-line stand-in for a finished
+   *  run. 查看 reopens the very same screen (nothing was ever thrown away). */
+  const restoreStatus = job.phase === 'done'
+    ? t('t.result.done')
+    : job.phase === 'error' ? t('t.restore.failed') : t('t.toast.cancelled');
+  const restoreEntries = job.result?.entries;
 
   return (
     <div
@@ -243,8 +283,8 @@ export function TranscribePage() {
             toast('warn', t('t.drop.rejected'));
             return;
           }
-          setIsJson(f.name.endsWith('.mai.json'));
-          setPath(f.name);
+          // a drop is a new task (rule 1): the previous run's trace goes away
+          jobPickFile(f.name, f.name.endsWith('.mai.json'));
         }}
         className="relative"
       >
@@ -259,16 +299,16 @@ export function TranscribePage() {
               transition={{ duration: 0.2, ease: [0.34, 1.56, 0.64, 1] }}
               className="grid h-14 w-14 place-items-center rounded-(--radius-l) bg-primary-dim text-primary"
             >
-              {isJson ? <FileJson size={26} strokeWidth={1.8} />
-                : isVideoPath(path) ? <FileVideo size={26} strokeWidth={1.8} />
+              {shownIsJson ? <FileJson size={26} strokeWidth={1.8} />
+                : isVideoPath(shownPath) ? <FileVideo size={26} strokeWidth={1.8} />
                 : <FileAudio size={26} strokeWidth={1.8} />}
             </motion.div>
-            {path ? (
+            {shownPath ? (
               <>
                 <p className="text-[15px] font-semibold text-ink-1">
-                  {path.split(/[\\/]/).pop()}
+                  {shownPath.split(/[\\/]/).pop()}
                 </p>
-                <p className="font-mono text-[11px] text-ink-3">{path}</p>
+                <p className="font-mono text-[11px] text-ink-3">{shownPath}</p>
               </>
             ) : (
               <p className="text-[14px] text-ink-2">
@@ -321,11 +361,11 @@ export function TranscribePage() {
       {/* controls: actions left, options right so the row uses its width */}
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <Button onClick={start} busy={busy} disabled={!path || busy}>
-            {busy ? t('t.action.running') : isJson ? t('t.action.process') : t('t.action.run')}
+          <Button onClick={start} busy={busy} disabled={!shownPath || busy}>
+            {busy ? t('t.action.running') : job.isJson ? t('t.action.process') : t('t.action.run')}
           </Button>
           {running && (
-            <Button variant="danger" onClick={() => jobId && cancelJob(jobId).catch(() => {})}>
+            <Button variant="danger" onClick={jobCancel}>
               {t('t.action.cancel')}
             </Button>
           )}
@@ -334,7 +374,9 @@ export function TranscribePage() {
       </div>
 
       {/* stage timeline: appears the moment the click lands (busy), even
-          though the first stage event may still be in flight */}
+          though the first stage event may still be in flight. The running
+          file's NAME lives here because the drop zone may already show the
+          next file (a drop while a job runs only prepares it) */}
       <AnimatePresence>
         {busy && (
           /* height-only reveal: a glass Card lives inside, and opacity
@@ -347,75 +389,115 @@ export function TranscribePage() {
             exit={{ height: 0 }}
             className="overflow-hidden"
           >
-            <Card className="flex items-center justify-between px-6 py-4">
-              {STAGES.map((s, i) => {
-                const on = i <= stageIdx;
-                const current = i === stageIdx;
-                return (
-                  <div key={s.id} className="flex flex-col items-center gap-2">
-                    <motion.div
-                      animate={current ? { scale: [1, 1.15, 1] } : { scale: 1 }}
-                      transition={current ? { repeat: Infinity, duration: 1.4 } : {}}
-                      className={`grid h-9 w-9 place-items-center rounded-full border transition-colors duration-(--dur-in) ${
-                        on
-                          ? 'border-primary bg-primary-dim text-primary'
-                          : 'border-line-1 text-ink-3'
-                      }`}
-                    >
-                      <s.icon size={15} strokeWidth={2} />
-                    </motion.div>
-                    <span className={`text-[10.5px] font-medium ${on ? 'text-primary' : 'text-ink-3'}`}>
-                      {t(s.label)}
-                    </span>
-                  </div>
-                );
-              })}
+            <Card className="flex flex-col gap-3 px-6 py-4">
+              {/* only while the job EXISTS: during the createJob roundtrip the
+                  store still holds the previous run's title */}
+              {running && job.title && (
+                <p className="truncate text-center font-mono text-[11px] text-ink-3">
+                  {tf('t.job.runningFile', { name: job.title })}
+                </p>
+              )}
+              <div className="flex items-center justify-between">
+                {STAGES.map((s, i) => {
+                  const on = i <= stageIdx;
+                  const current = i === stageIdx;
+                  return (
+                    <div key={s.id} className="flex flex-col items-center gap-2">
+                      <motion.div
+                        animate={current ? { scale: [1, 1.15, 1] } : { scale: 1 }}
+                        transition={current ? { repeat: Infinity, duration: 1.4 } : {}}
+                        className={`grid h-9 w-9 place-items-center rounded-full border transition-colors duration-(--dur-in) ${
+                          on
+                            ? 'border-primary bg-primary-dim text-primary'
+                            : 'border-line-1 text-ink-3'
+                        }`}
+                      >
+                        <s.icon size={15} strokeWidth={2} />
+                      </motion.div>
+                      <span className={`text-[10.5px] font-medium ${on ? 'text-primary' : 'text-ink-3'}`}>
+                        {t(s.label)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </Card>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* logs */}
-      {logs.length > 0 && (
-        <div
-          ref={logRef}
-          className="glass rounded-(--radius-m) h-56 overflow-y-auto px-4 py-3 font-mono text-[11.5px] leading-[1.7] text-ink-2"
-        >
-          {logs.map((l, i) => (
-            <div key={i} className={l.startsWith('dialogue') ? 'text-primary' : ''}>
-              {l}
-            </div>
-          ))}
+      {/* logs: the plain lines by default, the diagnostic stream (which always
+          runs, whichever view is open) behind the detail button -- so a bug
+          report can carry real numbers without pushing dB figures at everyone */}
+      {!folded && (job.logs.length > 0 || job.detailLogs.length > 0) && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => setShowDetail((v) => !v)}
+              disabled={job.detailLogs.length === 0}
+              title={t('t.log.detailHint')}
+            >
+              <ScrollText size={13} strokeWidth={2} />
+              {showDetail
+                ? t('t.log.hideDetail')
+                : tf('t.log.showDetail', { n: job.detailLogs.length })}
+            </Button>
+            <Button variant="ghost" onClick={copyDiagnostics} title={t('t.log.copyHint')}>
+              {copied
+                ? <Check size={13} strokeWidth={2} />
+                : <ClipboardCopy size={13} strokeWidth={2} />}
+              {copied ? t('t.log.copied') : t('t.log.copy')}
+            </Button>
+            {/* rule 3 while the run is on screen: the bar's × (below) only
+                exists in the folded view, so the expanded view needs its own */}
+            {isTerminal(job.phase) && (
+              <Button variant="ghost" onClick={jobDismiss} title={t('t.restore.clear')}>
+                <X size={13} strokeWidth={2} />
+                {t('t.restore.clear')}
+              </Button>
+            )}
+          </div>
+          <div
+            ref={logRef}
+            className="glass rounded-(--radius-m) h-56 overflow-y-auto px-4 py-3 font-mono text-[11.5px] leading-[1.7] text-ink-2"
+          >
+            {(showDetail ? job.detailLogs : job.logs).map((l, i) => (
+              <div key={i} className={l.startsWith('dialogue') ? 'text-primary' : ''}>
+                {l}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
       {/* result */}
-      {result && (
+      {!folded && job.result && (
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
           <Card className="flex flex-col gap-3 p-5">
             <div className="flex items-center justify-between">
               <span className="text-[14px] font-semibold text-ok">{t('t.result.done')}</span>
               <span className="text-[12px] text-ink-2">
-                {result.words != null && `${result.words} ${t('t.result.words')} / `}
-                {result.entries} {t('t.result.entries')}
-                {result.dialogue != null && ` / ${result.dialogue} ${t('t.result.dialogue')}`}
+                {job.result.words != null && `${job.result.words} ${t('t.result.words')} / `}
+                {job.result.entries} {t('t.result.entries')}
+                {job.result.dialogue != null && ` / ${job.result.dialogue} ${t('t.result.dialogue')}`}
               </span>
             </div>
             {(['srt_path', 'json_path'] as const).map(
               (k) =>
-                result[k] && (
+                job.result?.[k] && (
                   <div key={k} className="flex items-center gap-3">
                     <span className="w-10 text-[11px] uppercase text-ink-3">
                       {k === 'srt_path' ? 'srt' : 'json'}
                     </span>
                     <code className="flex-1 truncate font-mono text-[11.5px] text-primary">
-                      {result[k]}
+                      {job.result[k]}
                     </code>
                     <button
                       className="text-ink-2 transition-colors hover:text-primary"
                       onClick={() =>
-                        result[k] &&
-                        revealPath(result[k]!).catch((e) =>
+                        job.result?.[k] &&
+                        revealPath(job.result[k]!).catch((e) =>
                           toast('error', String(e).slice(0, 160)),
                         )
                       }
@@ -434,7 +516,7 @@ export function TranscribePage() {
           restores its LLM segmentation when the run produced one.
           Styled as a primary action (same colors/hover/shadow as 开始转录)
           but keeps its own size; flush left, not centered */}
-      {result && (
+      {!folded && job.result && (
         <div>
           <button
             onClick={() => window.dispatchEvent(new CustomEvent('mai2srt:nav', { detail: 'refine' }))}
@@ -445,9 +527,57 @@ export function TranscribePage() {
         </div>
       )}
 
-      {error && (
+      {!folded && job.phase === 'error' && job.error && (
         <Card className="border-err/40 p-4">
-          <p className="break-words font-mono text-[12px] text-err">{error}</p>
+          <p className="break-words font-mono text-[12px] text-err">{job.error}</p>
+        </Card>
+      )}
+
+      {/* cancelled is an outcome, not a failure: same neutral card, no red */}
+      {!folded && job.phase === 'cancelled' && (
+        <Card className="p-4">
+          <p className="text-[12px] text-ink-2">{t('t.toast.cancelled')}</p>
+        </Card>
+      )}
+
+      {/* the folded stand-in for a finished run (rule 2). Built from the SAME
+          Card anatomy as the params card above -- icon chip, one text line,
+          bordered action -- so the page reads as one material instead of a
+          flat outlined row sitting between glass cards (user feedback
+          2026-11-16). 查看 is a pure view toggle: the store still holds every
+          line, so reopening cannot lose anything; × is rule 3 */}
+      {folded && (
+        <Card className="flex items-center gap-3 px-4 py-2.5">
+          <span className="grid h-7 w-7 shrink-0 place-items-center rounded-(--radius-s) bg-primary-dim text-primary">
+            <History size={13} strokeWidth={2} />
+          </span>
+          <span className="min-w-0 flex-1 truncate text-[12px] text-ink-2">
+            <span className="text-ink-3">{t('t.restore.last')}：</span>
+            <span className="text-ink-1">{job.title}</span>
+            <span className="mx-2 text-ink-3">|</span>
+            <span className={job.phase === 'done' ? 'text-ok' : 'text-ink-3'}>
+              {restoreStatus}
+            </span>
+            {restoreEntries != null && (
+              <>
+                <span className="mx-1.5 text-ink-3">·</span>
+                {restoreEntries} {t('t.result.entries')}
+              </>
+            )}
+          </span>
+          <button
+            onClick={jobExpand}
+            className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-(--radius-s) border border-line-1 px-4 text-[13px] font-semibold text-ink-1 transition-all duration-(--dur-in) hover:border-primary/60 hover:bg-primary-dim hover:text-primary active:scale-[0.97]"
+          >
+            <RotateCcw size={13} strokeWidth={2} /> {t('t.restore.view')}
+          </button>
+          <button
+            onClick={jobDismiss}
+            title={t('t.restore.clear')}
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-(--radius-s) text-ink-3 transition-colors hover:bg-hover hover:text-ink-1"
+          >
+            <X size={13} strokeWidth={2} />
+          </button>
         </Card>
       )}
     </div>

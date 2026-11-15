@@ -79,6 +79,53 @@ _ASSUMED_DEFAULT_OUTPUT_TOKENS = 8_000
 #: M6d: fixed target-range floor (user decision -- trans-jimaku-web's 10~50)
 _TARGET_MIN_CHARS = 10
 
+#: INSERT PAUSE MARKERS INTO THE PROMPT (2026-11-15, trans-jimaku-web port).
+#: The model only ever saw flattened text, so it could not know that two short
+#: utterances were separated by seconds of dead air -- measured on a 55-min
+#: source: a line spanning a 16.8 s silence, 45 lines straddling a >= 3 s
+#: silence. A marker line ``⟪PAUSE 3.2s⟫`` states the silence's LENGTH without
+#: touching the text, which keeps the verbatim-alignment contract intact
+#: (markers are stripped from the reply before alignment).
+#:
+#: Threshold 1.5 s matches the audit that produced the rule: at >= 3 s the
+#: audio itself decides (must split), 1.5~3 s is the grey zone where meaning
+#: decides. Below 1.5 s a marker would be noise on every phrase boundary.
+PAUSE_MARKER_THRESHOLD_S = 1.5
+
+_PAUSE_MARKER_RE = re.compile(r"⟪PAUSE [0-9]+(?:\.[0-9]+)?s⟫")
+#: the marker line INCLUDING the newlines its insertion added, so stripping
+#: leaves text that joins back to the raw word stream
+_PAUSE_MARKER_LINE_RE = re.compile(r"\n?⟪PAUSE [0-9]+(?:\.[0-9]+)?s⟫\n?")
+
+
+def marked_text(words: list[Word],
+                threshold_s: float = PAUSE_MARKER_THRESHOLD_S) -> str:
+    """Glue the words into display text, with a silence marker where it goes.
+
+    ``⟪PAUSE x.xs⟫`` occupies its own line so the model can never mistake it
+    for transcript content. Whitespace handling matches ``join_words``.
+    """
+    out = ""
+    prev_end: float | None = None
+    for w in words:
+        t = w.text
+        if not t:
+            continue
+        if prev_end is not None and w.start - prev_end >= threshold_s:
+            out += "\n⟪PAUSE %.1fs⟫\n" % (w.start - prev_end)
+        elif out and _needs_space(out[-1], t[0]):
+            out += " "
+        out += t
+        prev_end = w.end
+    return out
+
+
+def strip_pause_markers(text: str) -> str:
+    """Drop the markers (and their newlines) from a model-returned line."""
+    if "⟪PAUSE" not in text:
+        return text
+    return _PAUSE_MARKER_LINE_RE.sub("", text)
+
 #: M6d: request retry chain (trans-jimaku-web parity)
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 2.0)
@@ -334,25 +381,10 @@ class SplitTask:
 
     run_id: int
     words: list[Word]
-    candidates: list[Candidate]   # sorted by index
-
-    def marked_text(self) -> str:
-        """Display text with ``[n|`` markers inserted at each candidate."""
-        no = {c.index: k + 1 for k, c in enumerate(self.candidates)}
-        out = ""
-        for i, w in enumerate(self.words):
-            t = w.text
-            if not t:
-                continue
-            if not out:
-                out = t
-            elif _needs_space(out[-1], t[0]):
-                out += " " + t
-            else:
-                out += t
-            if i in no:
-                out += f"[{no[i]}|"
-        return out
+    #: candidate cut points, sorted by index. Kept for fallback diagnostics and
+    #: future use only -- the M6f task shape sends free text (see marked_text
+    #: below, which inserts PAUSE markers, not candidate numbers).
+    candidates: list[Candidate]
 
 
 class Splitter(Protocol):
@@ -492,11 +524,17 @@ _SYSTEM_PROMPT = """你是字幕断句助手。输入是若干段语音转录文
 【硬性约束】
 - 不得增加、删除或改写任何字符；每段的所有行按顺序拼接后，必须与该段原文完全一致
 - 只调整断行位置，不得调换顺序、不得跨段拼接
+- 不要把 ⟪PAUSE …⟫ 标记写进输出：它是停顿提示，不是台词
+
+【停顿标记】
+- 单独占一行的「⟪PAUSE 3.2s⟫」表示该处音频静默了 3.2 秒，它不是文本内容
+- 标记表示 ≥3 秒停顿：该处**必须**分行，静默两侧的话绝不合并成同一行
+- 标记表示 1.5~3 秒停顿：结合语义判断——一问一答、疑似换人说话、明显另起话题时分行；同一句话中间的拖腔、犹豫、省略号停顿则保留在同一行
 
 【断句原则】
-- 以当前文本所用语言的常用句尾标点（如中/日文的「。」「？」「！」、西文的 . ? ! 以及其他语言对应的句尾符号）作为主要分割点，让每行以完整的句子收尾
-- 连续的短句可酌情合并成一行；每行建议落在 {min_chars}～{max_chars} 个字符之间，超过 {max_chars} 个字符必须拆分
-- 保持口语的自然节奏，不在意群中间强行切断；语气词不孤立成行，下一句的接头词不要挂到上一行末尾
+- 以当前文本所用语言的常用句尾标点（如中/日文的「。」「？」「！」、西文的 . ? ! 以及其他语言对应的句尾符号）作为主要分割点，让每行以完整的句子收尾；每行通常 {min_chars}～{max_chars} 个字符
+- 不要求凑字数：短回应、短感叹（うん、うわ。等）可以独立成行；但语气词与后文连成一气（中间没有停顿标记）时，应作为该句开头保留在同一行
+- 疑问句与紧跟其后的应答（如「…したい？」与「うん、…」）疑似两人一问一答，即使中间没有停顿标记，也不要合并成同一行
 - 音频事件标注（如「(笑声)」「<music>」）若独立出现，让它单独成行
 
 你还会收到一份【全文摘要】帮助理解语境，但断句必须严格基于【当前文本块】，不得引用或修改摘要内容。
@@ -817,7 +855,7 @@ class ProtocolSplitter:
         else:
             user = "请断句以下 %d 段：\n" % len(batch)
         for t in batch:
-            user += "\n[id=%d]\n%s\n" % (t.run_id, join_words(t.words))
+            user += "\n[id=%d]\n%s\n" % (t.run_id, marked_text(t.words))
         by_id = {t.run_id: t for t in batch}
 
         system = _SYSTEM_PROMPT.format(min_chars=_TARGET_MIN_CHARS,
@@ -915,7 +953,12 @@ class ProtocolSplitter:
         for item in results:
             if (isinstance(item, dict) and isinstance(item.get("id"), int)
                     and isinstance(item.get("lines"), list)):
-                lines = [s for s in item["lines"] if isinstance(s, str)]
+                # a model that echoes a ⟪PAUSE⟫ marker would break the verbatim
+                # alignment contract -- strip it, and drop the resulting blank
+                # line (a marker on its own is not a subtitle line)
+                lines = [strip_pause_markers(s).strip()
+                         for s in item["lines"] if isinstance(s, str)]
+                lines = [s for s in lines if s]
                 if lines:
                     parsed[item["id"]] = lines
         if not parsed:

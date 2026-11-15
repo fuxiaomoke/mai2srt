@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
+from ..messages import tr
 from ..transcribe.parser import Transcript, Word
 from .candidates import find_candidates
 from .llm import SplitTask, Splitter
@@ -35,7 +36,7 @@ from .rules import (
     merge_short,
     split_fallback,
 )
-from .turns import Turn, build_turns
+from .turns import Turn, absorb_fragments, build_turns
 
 Log = Callable[[str], None]
 
@@ -71,17 +72,33 @@ def segment_transcript(
     splitter: Splitter | None = None,
     log: Log | None = None,
     llm_status: list[str] | None = None,
+    lang: str = "zh",
 ) -> list[Segment]:
     """Turn a stitched transcript into final subtitle segments.
 
     ``llm_status`` (optional out-param): the splitter failure message is
     appended when the LLM call fails and the fallback took over, so callers
-    can surface a warning instead of silently degrading.
+    can surface a warning instead of silently degrading. ``lang`` only picks
+    the language of the narration this layer emits (the splitter's own
+    technical messages stay English for the detail log).
     """
     p = params or SegmentParams()
     emit: Log = log or (lambda m: None)
     words = sorted(t.words, key=lambda w: w.start)
+    # 2026-11-15: a speaker change is not automatically a turn boundary --
+    # runs too short to be a subtitle line fold into their neighbour first
+    # (turns.absorb_fragments). Without this the jittery label stream became
+    # one subtitle line per word and never reached the limits, so the model
+    # was never asked about the passages that needed it most.
     turns = build_turns(words)
+    raw_turns = len(turns)
+    # the fragment floors are internal judgement calls about diarization noise
+    # (1.5 s / 5 chars, measured), not display style: only the CAPS come from
+    # the user's params
+    turns = absorb_fragments(turns, max_duration_s=p.max_duration_s,
+                             max_chars=p.max_chars)
+    if len(turns) != raw_turns:
+        emit(tr(lang, "run.seg_absorb", before=raw_turns, after=len(turns)))
 
     final: list[Segment] = []
     tasks: list[SplitTask] = []

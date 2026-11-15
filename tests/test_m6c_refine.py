@@ -26,18 +26,23 @@ def _client(tmp_path):
 
 
 def _write_mai_json(tmp_path: Path, name: str = "sample.mai.json") -> Path:
-    """Small two-speaker transcript: 8 words across 6 seconds."""
+    """Small two-speaker transcript: 8 words across 7 seconds.
+
+    sp1 speaks, sp2 answers (adjacent), then sp1 returns ADJACENTLY -- MAI's
+    X-Y-X interleave, the only shape that becomes a dialogue line since
+    2026-11-15 (a plain A/B exchange no longer does, see test_m3_pure)."""
     words = [
         {"text": "こんにちは", "start": 0.0, "end": 0.8, "speaker": "1"},
         {"text": "皆さん", "start": 0.9, "end": 1.4, "speaker": "1"},
-        {"text": "今日は", "start": 1.5, "end": 2.0, "speaker": "1"},
+        {"text": "今日は", "start": 1.5, "end": 2.0, "speaker": "2"},
         {"text": "はい", "start": 2.1, "end": 2.4, "speaker": "2"},
-        {"text": "よろしく", "start": 2.5, "end": 3.1, "speaker": "2"},
-        {"text": "お願いします", "start": 3.2, "end": 4.2, "speaker": "2"},
-        {"text": "では", "start": 5.0, "end": 5.3, "speaker": "1"},
-        {"text": "始めましょう", "start": 5.4, "end": 6.2, "speaker": "1"},
+        {"text": "よろしく", "start": 2.5, "end": 3.1, "speaker": "1"},
+        {"text": "お願いします", "start": 3.2, "end": 4.2, "speaker": "1"},
+        # 1.8 s later, a different speaker: a solo line after the dialogue
+        {"text": "では", "start": 6.0, "end": 6.3, "speaker": "2"},
+        {"text": "始めましょう", "start": 6.4, "end": 7.2, "speaker": "2"},
     ]
-    doc = {"text": "", "language": "ja", "duration": 6.5,
+    doc = {"text": "", "language": "ja", "duration": 7.5,
            "engine": "test", "words": words, "utterances": []}
     p = tmp_path / name
     p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")

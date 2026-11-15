@@ -182,6 +182,35 @@ Write-Host "    $Remote -> $remoteUrl"
 Write-Host "    push ref: $Branch`:$TargetBranch"
 Write-Host "    message : $Message"
 
+# ------------------------------------------------------------ 4b. tag preflight
+# A tag is the ONLY thing that starts a build, and the only thing here that
+# cannot be taken back without a remote delete, so both ways it can go wrong
+# are checked BEFORE the branch is pushed.
+#
+#   * wrong shape: "0.1.5" (no "v") never matches the workflow's `v*` filter,
+#     so CI would silently not run while this script reported success; a tag
+#     that is merely the wrong number does run, burns a runner, and fails the
+#     workflow's tag==version gate, leaving a dangling tag behind.
+#   * already taken: the local check alone is not enough -- a tag created in
+#     the GitHub UI exists only on the remote, and the failure would then land
+#     AFTER the branch push had already gone out.
+if ($Tag) {
+    Step "tag"
+    if ($Tag -ne "v$version") {
+        if ($Tag -notmatch '^v') {
+            Fail "tag '$Tag' has no 'v' prefix.`n  Use -Tag v$version. The workflow only listens for 'v*', so a tag without it never starts a build -- and nothing would tell you."
+        }
+        Fail "tag '$Tag' is not the version on master ($version).`n  Use -Tag v$version. Enough of the workflow would run to fail its tag==version gate, leaving a tag nobody can reuse."
+    }
+    & git rev-parse --verify --quiet "refs/tags/$Tag" | Out-Null
+    if ($LASTEXITCODE -eq 0) { Fail "tag $Tag already exists locally; pick another name" }
+    $remoteTag = @(Invoke-Git ls-remote --tags $Remote "refs/tags/$Tag")
+    if ($remoteTag -and "$remoteTag".Trim()) {
+        Fail "tag $Tag already exists on '$Remote':`n  $($remoteTag -join "`n  ")"
+    }
+    Write-Host "    $Tag -> created at the snapshot commit, then pushed"
+}
+
 if (-not $Push) {
     Write-Host ""
     Write-Host "DRY RUN -- nothing was written. Re-run with -Push to do it." -ForegroundColor Yellow
@@ -233,10 +262,11 @@ if ($LASTEXITCODE -ne 0) { Fail "push failed -- if this is a timeout, github is 
 
 if ($Tag) {
     Step "tagging $Tag"
-    & git rev-parse --verify --quiet "refs/tags/$Tag" | Out-Null
-    if ($LASTEXITCODE -eq 0) { Fail "tag $Tag already exists locally; pick another name" }
+    # existence (local and remote) was already ruled out before the push
     & git tag -a $Tag -m "mai2srt v$version" $BranchRef
     if ($LASTEXITCODE -ne 0) { Fail "git tag failed" }
+    # ONE ref, by name: `push --tags` would also send any other tag lying
+    # around locally, and each of those starts a build too
     Invoke-Git push $Remote "refs/tags/$Tag"
     if ($LASTEXITCODE -ne 0) { Fail "tag push failed" }
     Write-Host "    $Tag pushed -- CI on '$Remote' now builds and publishes the Release"

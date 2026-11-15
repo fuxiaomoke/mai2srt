@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mai2srt.postprocess import (
@@ -32,50 +34,64 @@ def E(start, end, text, speakers, **kw):
 
 
 # ---------------------------------------------------------------- dialogue
+# 2026-11-15: the trigger is MAI's word-order interleave (X Y X), not
+# "adjacent + different label". The old rule was measured against ground truth
+# on a 55-min source: 31/31 of its dialogue lines were one sentence cut in half
+# (the worst passage is a deliberate A/B duet read where the diarizer puts the
+# handoffs one word off), and it regrouped the text by speaker, scrambling it.
 
-def test_dialogue_adjacent_pair_merges_with_tolerance():
-    # spike-measured shape: simultaneous speech arrives as adjacent
-    # different-speaker entries with a tiny 0.02 s gap
+def test_dialogue_needs_the_xyx_return():
+    # A -> B -> A, all adjacent: the speaker RETURNS, so this is an interleave
     entries = [
         E(0.64, 0.90, "あなた様。", {"1"}),
         E(0.92, 1.82, "あなた様。", {"2"}),
-        E(4.24, 6.44, "紳士の特別な空間。", {"1"}),   # 2.4 s away: solo
+        E(1.86, 2.60, "そうですわね。", {"1"}),
     ]
     out = detect_dialogue(entries)
-    assert len(out) == 2
+    assert len(out) == 1
     d = out[0]
-    assert d.is_dialogue and d.start == 0.64 and d.end == 1.82
-    assert d.text == "- あなた様。\n- あなた様。"
-    assert not out[1].is_dialogue
+    assert d.is_dialogue and d.start == 0.64 and d.end == 2.60
+    # per-speaker grouping is CORRECT for a real interleave
+    assert d.text == "- あなた様。そうですわね。\n- あなた様。"
+
+
+def test_dialogue_plain_exchange_is_two_lines_not_a_pair():
+    """The deleted rule: adjacent different speakers alone are NOT dialogue.
+
+    Two utterances in a row is ordinary turn-taking -- merging them was the
+    fake-dialogue generator this pass removed."""
+    entries = [
+        E(0.64, 0.90, "あなた様。", {"1"}),
+        E(0.92, 1.82, "あなた様。", {"2"}),
+    ]
+    out = detect_dialogue(entries)
+    assert len(out) == 2 and not any(e.is_dialogue for e in out)
 
 
 def test_dialogue_gap_over_tolerance_stays_solo():
     entries = [
-        E(0.0, 1.0, "A1", {"1"}),
-        E(1.3, 2.0, "B1", {"2"}),     # 0.3 s gap > 0.2 tolerance
+        E(0.0, 1.9, "A1", {"1"}),
+        E(2.6, 4.0, "B1", {"2"}),     # 0.7 s gap > 0.2 tolerance
+        E(4.3, 6.0, "A2", {"1"}),     # 0.3 s gap: still no adjacency, no seed
     ]
     out = detect_dialogue(entries, tolerance_s=0.2)
-    assert len(out) == 2 and not any(e.is_dialogue for e in out)
+    assert not any(e.is_dialogue for e in out)
 
 
-def test_dialogue_transitive_chain_merges():
-    # X Y X pattern: A-B near, B-A near -> all three in one group
+def test_dialogue_xyxy_chain_grows():
+    # X Y X Y: the returning speaker seeds the region, the fourth line joins it
     entries = [
         E(0.0, 2.0, "A1", {"A"}),
         E(2.05, 4.0, "B1", {"B"}),
         E(4.1, 6.0, "A2", {"A"}),
+        E(6.05, 8.0, "B2", {"B"}),
     ]
     out = detect_dialogue(entries, tolerance_s=0.2)
     assert len(out) == 1
-    d = out[0]
-    assert d.is_dialogue
-    # first-appearance order: A line first, B second; A fragments glued
-    # (latin fragments get a space via the CJK-aware separator)
-    assert d.text == "- A1 A2\n- B1"
+    assert out[0].text == "- A1 A2\n- B1 B2"
 
 
-def test_dialogue_same_speaker_overlap_not_merged():
-    # same-speaker entries never union: no dialogue from one voice
+def test_dialogue_same_speaker_never_merges():
     entries = [
         E(0.0, 2.0, "A1", {"1"}),
         E(2.05, 4.0, "A2", {"1"}),
@@ -84,26 +100,56 @@ def test_dialogue_same_speaker_overlap_not_merged():
     assert len(out) == 2 and not any(e.is_dialogue for e in out)
 
 
-def test_dialogue_three_speaker_group_skipped():
-    logs = []
+def test_dialogue_mixed_speaker_line_never_seeds():
+    """A line whose words carry two labels is a diarization accident: it cannot
+    stand in for either voice, so it neither seeds nor joins a region."""
     entries = [
         E(0.0, 2.0, "A", {"1"}),
         E(2.05, 4.0, "B", {"2"}),
-        E(4.1, 6.0, "C", {"3"}),
+        E(4.1, 6.0, "AB", {"1", "2"}),
     ]
-    out = detect_dialogue(entries, tolerance_s=0.2, max_speakers=2, log=logs.append)
-    assert len(out) == 3                 # nothing merged
+    out = detect_dialogue(entries, tolerance_s=0.2)
     assert not any(e.is_dialogue for e in out)
-    assert any("3 speakers" in m for m in logs)
 
 
 def test_dialogue_none_speaker_never_joins():
     entries = [
         E(0.0, 2.0, "A", {"1"}),
         E(2.05, 4.0, "B", {None}),
+        E(4.1, 6.0, "C", {"1"}),
     ]
     out = detect_dialogue(entries)
-    assert len(out) == 2 and not any(e.is_dialogue for e in out)
+    assert not any(e.is_dialogue for e in out)
+
+
+def test_dialogue_xyzx_needs_three_speakers_allowed():
+    """X Y Z X (three voices) seeds only when the cap allows three."""
+    entries = [
+        E(0.0, 2.0, "A", {"1"}),
+        E(2.05, 4.0, "B", {"2"}),
+        E(4.05, 6.0, "C", {"3"}),
+        E(6.05, 8.0, "A2", {"1"}),
+    ]
+    out = detect_dialogue(entries, tolerance_s=0.2, max_speakers=2, log=lambda m: None)
+    assert not any(e.is_dialogue for e in out)
+    out = detect_dialogue(entries, tolerance_s=0.2, max_speakers=3, log=lambda m: None)
+    assert len(out) == 1 and out[0].is_dialogue
+
+
+def test_dialogue_caps_refuse_a_giant_region():
+    logs = []
+    entries = [
+        E(0.0, 6.0, "A" * 40, {"1"}),
+        E(6.05, 12.0, "B" * 40, {"2"}),
+        E(12.05, 18.0, "C" * 40, {"1"}),
+    ]
+    out = detect_dialogue(entries, tolerance_s=0.2, max_chars=100, log=logs.append)
+    assert not any(e.is_dialogue for e in out)
+    assert any("over the 100-char cap" in m for m in logs)
+    out = detect_dialogue(entries, tolerance_s=0.2, max_duration_s=10.0,
+                          max_chars=1000, log=logs.append)
+    assert not any(e.is_dialogue for e in out)
+    assert any("over the 10.0s cap" in m for m in logs)
 
 
 # ---------------------------------------------------------------- merge
@@ -184,25 +230,46 @@ def test_expand_outward_clamps_first_last():
     assert abs(entries[0].end - 1.25) < 1e-9       # clamped at audio end 1.5
 
 
-def test_final_format_spacing_and_min_duration():
+def test_final_format_extends_into_real_silence_only():
     p = PostprocessParams(min_gap_s=0.1, min_duration_s=1.2, min_duration_abs_s=0.5)
     entries = [
         E(0.0, 1.0, "A", {"1"}),
-        E(1.02, 1.2, "B", {"1"}),     # 20 ms gap -> pushed to 1.1; short -> extended
+        E(4.0, 4.4, "B", {"1"}),      # plenty of silence before it
     ]
     out = final_format(entries, p)
-    assert out[1].start >= out[0].end + 0.1 - 1e-9
-    assert out[1].duration >= 1.2 - 1e-9
+    assert out[0].start == 0.0                    # start untouched
+    assert out[0].end == 1.2                      # extended to the 1.2 s target
+    assert out[1].start == 4.0                    # never pushed
+    assert out[1].end == 5.2
 
 
-def test_final_format_overlap_fix():
+def test_final_format_never_pushes_a_start():
+    """2026-11-15: the old pass moved `cur.start` to `prev.end + min_gap` after
+    extending the previous line, so one short line shifted the whole file late
+    (measured +4.9 s at 68 s). Starts are now sacred."""
+    p = PostprocessParams(min_gap_s=0.1, min_duration_s=1.2, min_duration_abs_s=0.5)
+    entries = [
+        E(0.0, 1.0, "A", {"1"}),
+        E(1.02, 1.2, "B", {"1"}),     # 20 ms after A: no room to extend A
+        E(1.25, 1.5, "C", {"1"}),
+    ]
+    out = final_format(entries, p, audio_duration_s=1.5)
+    assert [e.start for e in out] == [0.0, 1.02, 1.25]      # all untouched
+    # A cannot reach 1.2 s: 1.02 - 0.1 = 0.92 is the most the silence allows
+    assert out[0].end == pytest.approx(0.92)
+    assert out[1].end == pytest.approx(1.15)      # 1.25 - 0.1
+    assert out[2].end == pytest.approx(1.5)       # clamped at the audio end
+
+
+def test_final_format_overlap_trims_the_previous_tail():
     p = PostprocessParams(min_gap_s=0.1, min_duration_s=1.2, min_duration_abs_s=0.5)
     entries = [
         E(0.0, 2.0, "A", {"1"}),
         E(1.5, 3.0, "B", {"1"}),      # overlapping start
     ]
     out = final_format(entries, p)
-    assert out[1].start >= out[0].end + 0.01
+    assert out[1].start == 1.5                    # start kept
+    assert out[0].end == pytest.approx(1.4)       # previous tail trimmed
 
 
 # ---------------------------------------------------------------- srt + e2e
@@ -215,15 +282,16 @@ def test_format_ts_and_srt_roundtrip():
 
 
 def _dual_transcript():
-    # alternating two-speaker stream with one near-simultaneous pair
+    # X Y X at the top (three adjacent turns -> one dialogue line), then two
+    # long solo stretches separated by real pauses
     words = []
     words += [W("こ", 0.64 + i * 0.08, 0.72 + i * 0.08, "1") for i in range(3)]
     words += [W("ん", 0.92 + i * 0.08, 1.00 + i * 0.08, "2") for i in range(3)]
-    words += [W("は", 4.24 + i * 0.2, 4.44 + i * 0.2, "1") for i in range(6)]
-    words += [W("い", 7.76 + i * 0.2, 7.96 + i * 0.2, "2") for i in range(6)]
-    words += [W("を", 10.2 + i * 0.2, 10.4 + i * 0.2, "1") for i in range(4)]
-    words.append(W("。", 11.2, 11.3, "1"))
-    return Transcript(words=words, duration_s=12.0, language="ja")
+    words += [W("は", 1.20 + i * 0.08, 1.28 + i * 0.08, "1") for i in range(3)]
+    words += [W("い", 3.00 + i * 0.2, 3.20 + i * 0.2, "2") for i in range(6)]
+    words += [W("を", 6.00 + i * 0.2, 6.20 + i * 0.2, "1") for i in range(4)]
+    words.append(W("。", 6.90, 7.00, "1"))
+    return Transcript(words=words, duration_s=8.0, language="ja")
 
 
 def test_process_end_to_end_dual_speaker():
@@ -231,7 +299,7 @@ def test_process_end_to_end_dual_speaker():
     segs = segment_transcript(t, SegmentParams(max_chars=8, min_chars=2))
     logs = []
     out = process(segs, audio_duration_s=t.duration_s, log=logs.append)
-    # exactly one dialogue group: the 0.02 s-gap sp1/sp2 pair at the top
+    # exactly one dialogue group: the X-Y-X interleave at the top
     dials = [e for e in out if e.is_dialogue]
     assert len(dials) == 1
     assert dials[0].text.startswith("- ")
@@ -277,26 +345,31 @@ def test_flagship_hora_ya_buracon():
 
 
 def test_flagship_tolerance_needed():
-    """0.02 s regression gap still hits within the 0.2 s tolerance."""
+    """0.05 s regression gap still hits within the 0.2 s tolerance.
+
+    Two-character turns on purpose: a ONE-character turn is now folded as an
+    artifact (turns.absorb_fragments), which would erase the pattern."""
     words = [
-        _w("あ", 10.0, 10.5, "0"), _w("い", 10.55, 11.0, "1"),
-        _w("う", 11.05, 11.5, "0"),
+        _w("ああ", 10.0, 10.5, "0"),
+        _w("いい", 10.55, 11.0, "1"),
+        _w("うう", 11.05, 11.5, "0"),
     ]
     out = _run_chain(words, 20.0)
     dials = [e for e in out if e.is_dialogue]
     assert len(dials) == 1
-    assert dials[0].text == "- あう\n- い"
+    assert dials[0].text == "- ああうう\n- いい"
 
 
 def test_flagship_no_trigger_beyond_tolerance():
     """real turn-taking (gaps beyond tolerance) -> three solo lines."""
     words = [
-        _w("あ", 10.0, 10.5, "0"), _w("い", 10.75, 11.0, "1"),
-        _w("う", 11.3, 11.5, "0"),
+        _w("ああ", 10.0, 10.5, "0"),
+        _w("いい", 10.75, 11.0, "1"),
+        _w("うう", 11.3, 11.5, "0"),
     ]
     out = _run_chain(words, 20.0)
     assert not any(e.is_dialogue for e in out)
-    assert [e.text for e in out] == ["あ", "い", "う"]
+    assert [e.text for e in out] == ["ああ", "いい", "うう"]
 
 
 if __name__ == "__main__":

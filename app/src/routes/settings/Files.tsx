@@ -17,7 +17,7 @@ import { StorageCard } from './StorageCard';
 /* -------------------------------------------------- settings > files & accounts */
 
 export function FilesSettings() {
-  const { t, tf } = useI18n();
+  const { t, tf, lang } = useI18n();
   // seed from the startup warm cache: when it hits, the very first render
   // is already complete (and refresh() below just revalidates silently)
   const [sys, setSys] = useState<SystemInfo | null>(warmSystem);
@@ -55,7 +55,7 @@ export function FilesSettings() {
   async function signIn() {
     setLoginBusy(true);
     try {
-      const job = await createJob({ kind: 'login' });
+      const job = await createJob({ kind: 'login', lang });
       subscribeJob(job.id, {
         onLog: () => {},
         onDone: (d) => {
@@ -93,7 +93,7 @@ export function FilesSettings() {
   async function acceptConsent() {
     setConsentBusy(true);
     try {
-      const job = await createJob({ kind: 'consent' });
+      const job = await createJob({ kind: 'consent', lang });
       subscribeJob(job.id, {
         onLog: () => {},
         onDone: (d) => {

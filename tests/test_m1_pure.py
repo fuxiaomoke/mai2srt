@@ -9,7 +9,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mai2srt.config import (  # noqa: E402
-    COMPRESS_TARGET_BYTES, MP3_BITRATE_MAX_BPS, MP3_BITRATE_MIN_BPS,
+    CHUNK_TARGET_SECONDS, COMPRESS_TARGET_BYTES, MAX_SINGLE_UPLOAD_SECONDS,
+    MIN_CHUNK_S, MP3_BITRATE_MAX_BPS, MP3_BITRATE_MIN_BPS,
 )
 from mai2srt.media.chunk import plan_chunks  # noqa: E402
 from mai2srt.media.compress import mp3_bitrate_bps  # noqa: E402
@@ -39,26 +40,97 @@ def test_plan_short_audio_single_piece():
     assert plan.offsets == [0.0]
 
 
-def test_plan_prefers_silence_at_boundary():
-    dur = 7000.0
-    silences = [1000.0, 3300.0, 3450.0, 6900.0]
-    plan = plan_chunks(dur, silences, target_s=3480.0)
-    # first cut: latest silence <= 3480 -> 3450 (not the hard 3480)
-    assert plan.pieces[0] == (0.0, 3450.0)
-    # second: latest silence <= 3450+3480=6930 -> 6900
-    assert plan.pieces[1] == (3450.0, 6900.0)
-    assert plan.pieces[2] == (6900.0, dur)
-    assert plan.offsets == [0.0, 3450.0, 6900.0]
+def test_plan_splits_into_balanced_pieces():
+    """40 minutes is the shape the user asked for: two 20-minute pieces, not
+    "fill 29 minutes, then dump the remaining 11"."""
+    pieces = plan_chunks(40 * 60.0, []).pieces
+    assert len(pieces) == 2
+    assert pieces[0] == (0.0, 1200.0)
+    assert pieces[1] == (1200.0, 2400.0)
 
 
-def test_plan_hard_cut_when_no_silence():
+def test_plan_prefers_the_pause_nearest_the_even_split():
+    dur = 40 * 60.0
+    # pause midpoints: one dead on the even split, one 40s early
+    plan = plan_chunks(dur, [1199.0, 1160.0])
+    assert plan.pieces[0][1] == 1199.0
+
+
+def test_plan_keeps_a_pause_inside_the_snap_window_only():
+    dur = 40 * 60.0
+    # 600s is 10 minutes off the 1200s split -- outside the +/-15% window,
+    # so it must be ignored rather than drag the cut 10 minutes early
+    plan = plan_chunks(dur, [600.0])
+    assert plan.pieces == [(0.0, 1200.0), (1200.0, dur)]
+
+
+def test_plan_even_split_when_there_are_no_pauses():
+    # 7000s needs 3 pieces at a 3480s cap; with no pauses they are dead even
     plan = plan_chunks(7000.0, [], target_s=3480.0)
-    assert plan.pieces == [(0.0, 3480.0), (3480.0, 6960.0), (6960.0, 7000.0)]
+    assert len(plan.pieces) == 3
+    step = 7000.0 / 3
+    for i, (s, e) in enumerate(plan.pieces):
+        assert s == pytest.approx(i * step)
+        assert e == pytest.approx((i + 1) * step)
+
+
+# --- no stub tail (issue #5) --------------------------------------------------
+
+def test_plan_never_leaves_a_stub_tail():
+    """A source a few seconds past a 29-min multiple used to end with a 2-6s
+    piece: the old planner filled to the cap and appended the residue, and a
+    residue that short is the media's quiet tail. The server answers such a
+    piece with HTTP 422 "No speech was found in this audio", which used to
+    kill the whole run.
+
+    5224s = 87 min 4s is the shape from the issue (4 chunks, the LAST one 4s
+    and 0.1 MiB). Balanced splitting has no residue to place: the minimum
+    piece is target/2 = 870s = 14.5 min."""
+    dur = 5224.0
+    pieces = plan_chunks(dur, []).pieces
+    assert len(pieces) == 4
+    assert min(e - s for s, e in pieces) >= CHUNK_TARGET_SECONDS / 2
+
+
+def test_option_c_buys_room_to_cut_inside_pauses():
+    """Exactly three caps' worth of audio leaves the even split no slack at
+    all (the cut can only sit at 1740s), so the planner takes one extra piece
+    -- and only because that turns the hard cuts into pause-aligned ones."""
+    dur = 3 * CHUNK_TARGET_SECONDS
+    pauses = [dur / 4, dur / 2, 3 * dur / 4]          # nowhere near 1740s
+    assert len(plan_chunks(dur, pauses).pieces) == 4
+
+
+def test_option_c_is_skipped_when_extra_pieces_buy_nothing():
+    """No pauses at all: one more piece is one more upload for the same hard
+    cuts, so the minimum count wins."""
+    dur = 3 * CHUNK_TARGET_SECONDS
+    pieces = plan_chunks(dur, []).pieces
+    assert len(pieces) == 3
+    assert all(abs(e - s - CHUNK_TARGET_SECONDS) < 1e-6 for s, e in pieces)
+
+
+def test_plan_invariants_hold_for_any_length():
+    """Contiguous coverage, nothing over the cap, nothing under the floor, and
+    every piece within 30% of the even split (i.e. no residue)."""
+    for dur in [x * 7.3 for x in range(1, 2000)]:
+        pieces = plan_chunks(dur, []).pieces
+        assert pieces[0][0] == 0.0
+        assert pieces[-1][1] == dur
+        for (_a, b), (c, _d) in zip(pieces, pieces[1:]):
+            assert b == c, dur                     # no gap, no overlap
+        ideal = dur / len(pieces)
+        for a, b in pieces:
+            assert b - a >= min(MIN_CHUNK_S, dur) - 1e-9, (dur, b - a)
+            assert b - a <= CHUNK_TARGET_SECONDS + 1e-9, dur
+            assert b - a <= MAX_SINGLE_UPLOAD_SECONDS, dur
+            # the even split is the point: no piece is a residue
+            assert b - a >= ideal * 0.7 - 1e-9, (dur, b - a, ideal)
 
 
 # --- silence scan / prepare progress (2026-10-13 fixes) -----------------------
 
-def test_detect_silences_skips_video_decode(monkeypatch, tmp_path):
+def test_quiet_scan_skips_video_decode(monkeypatch, tmp_path):
     """-vn: the silence scan must not decode a video's picture stream --
     a 69-min video burned 11.5 min here decoding video for nothing."""
     from mai2srt.media import chunk as chunk_mod
@@ -67,7 +139,7 @@ def test_detect_silences_skips_video_decode(monkeypatch, tmp_path):
 
     class _R:
         returncode = 0
-        stderr = "silence_end: 12.0 | silence_duration: 1.0"
+        stderr = "silence_start: 11.0\nsilence_end: 12.0 | silence_duration: 1.0"
 
     def fake_run_tool(cmd, **kw):
         argv["cmd"] = cmd
@@ -75,18 +147,22 @@ def test_detect_silences_skips_video_decode(monkeypatch, tmp_path):
 
     monkeypatch.setattr(chunk_mod, "run_tool", fake_run_tool)
     monkeypatch.setattr(chunk_mod, "resolve_tool", lambda name: "ffmpeg")
-    ends = chunk_mod.detect_silences(tmp_path / "x.mp4")
-    assert ends == [12.0]
+    gaps = chunk_mod._scan_quiet(tmp_path / "x.mp4", -31.0, 0.3, 100.0)
+    assert gaps == [(11.0, 12.0)]        # start AND end, not just the end
     assert "-vn" in argv["cmd"]
+    assert any("silencedetect=noise=-31.0dB" in a for a in argv["cmd"])
 
 
 def test_prepare_reports_progress(monkeypatch, tmp_path):
-    """prepare() must narrate the silence scan / plan / encodes: long
-    videos sit in preparation for minutes and a silent UI looked wedged."""
+    """prepare() must narrate the analysis / plan / encodes: long videos sit in
+    preparation for minutes and a silent UI looked wedged. The lines stay
+    plain -- the numbers behind them go to the log, shown on demand."""
     from mai2srt.media import chunk as chunk_mod
     from mai2srt.media.probe import MediaInfo
 
-    monkeypatch.setattr(chunk_mod, "detect_silences", lambda src: [1730.0, 3470.0])
+    monkeypatch.setattr(chunk_mod, "detect_quiet", lambda src, dur: chunk_mod.QuietMap(
+        gaps=[(1329.0, 1330.0), (2669.0, 2670.0)],
+        peak_db=-1.0, threshold_db=-31.0, duration_s=dur))
 
     def fake_cut(src, dst, s, e):
         dst.write_bytes(b"x" * 2048)
@@ -100,12 +176,12 @@ def test_prepare_reports_progress(monkeypatch, tmp_path):
     out = chunk_mod.prepare(Path("lec.mp4"), info, tmp_path,
                             on_progress=lines.append)
 
-    # 4000s -> 3 pieces cut at the planted silences (1730s, 3470s)
-    assert [off for _, off in out] == [0.0, 1730.0, 3470.0]
-    assert any("scanning for silence points" in m for m in lines)
-    assert any("planned 3 chunks" in m for m in lines)
-    assert any("encoding chunk 1/3" in m for m in lines)
-    assert any("chunk 3/3 ready" in m for m in lines)
+    # 4000s -> 3 balanced pieces (1333s ideal), each cut inside a planted pause
+    assert [off for _, off in out] == [0.0, 1329.5, 2669.5]
+    assert any("正在分析音频断点" in m for m in lines)
+    assert any("切块：3 段" in m for m in lines)
+    assert any("编码第 1/3 段" in m for m in lines)
+    assert any("第 3/3 段就绪" in m for m in lines)
 
 
 def test_prepare_progress_passthrough(monkeypatch, tmp_path):
@@ -119,7 +195,20 @@ def test_prepare_progress_passthrough(monkeypatch, tmp_path):
     out = chunk_mod.prepare(Path("s.mp3"), info, tmp_path,
                             on_progress=lines.append)
     assert out == [(Path("s.mp3"), 0.0)]
-    assert any("sending as-is" in m for m in lines)
+    assert any("直接上传" in m for m in lines)
+
+
+def test_prepare_refuses_a_signal_free_file(monkeypatch, tmp_path):
+    """Nothing but silence: fail before uploading a single byte."""
+    from mai2srt.media import chunk as chunk_mod
+    from mai2srt.media.probe import MediaError, MediaInfo
+
+    monkeypatch.setattr(chunk_mod, "detect_quiet", lambda src, dur: chunk_mod.QuietMap(
+        peak_db=-91.0, duration_s=dur, no_signal=True))
+    info = MediaInfo(duration_s=4000.0, channels=2, sample_rate=44100,
+                     codec="aac", ext="mp4", size_bytes=10**9)
+    with pytest.raises(MediaError, match="没有检测到人声"):
+        chunk_mod.prepare(Path("silent.mp4"), info, tmp_path)
 
 
 # --- SSE parsing -------------------------------------------------------------

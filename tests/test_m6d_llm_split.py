@@ -15,7 +15,8 @@ from mai2srt.segment import llm
 from mai2srt.segment.candidates import find_candidates
 from mai2srt.segment.llm import (
     LLMSplitError, LLMEndpoint, ProtocolSplitter, SplitTask, _SYSTEM_PROMPT,
-    _TARGET_MIN_CHARS, _align_lines, _is_retryable_error,
+    _TARGET_MIN_CHARS, _align_lines, _is_retryable_error, marked_text,
+    strip_pause_markers,
 )
 from mai2srt.segment.rules import SegmentParams, join_words
 from mai2srt.transcribe.parser import Word
@@ -48,10 +49,17 @@ def test_prompt_free_text_shape_and_range():
     # verbatim hard constraint (trans-jimaku-web's load-bearing rule)
     assert "不得增加、删除或改写任何字符" in p
     assert "完全一致" in p
-    # target RANGE + explicit merge instruction (anti-fragmentation)
+    # target RANGE
     assert "%d～%d" % (_TARGET_MIN_CHARS, 60) in p
-    assert "连续的短句可酌情合并" in p
     assert _TARGET_MIN_CHARS == 10
+    # 2026-11-15: the segmentation rules now say what the OLD "连续的短句可酌情
+    # 合并" line got wrong -- that instruction invited merging utterances across
+    # long silences. Replaced by: don't pad lines / keep Q and A apart / split
+    # at any >= 3 s pause marker.
+    assert "连续的短句可酌情合并" not in p
+    assert "不要求凑字数" in p
+    assert "一问一答" in p
+    assert "⟪PAUSE" in p and "≥3 秒" in p
     # reply contract: complete lines, not candidate numbers
     assert '"lines"' in p
     assert "splits" not in p
@@ -68,6 +76,34 @@ def test_prompt_is_language_agnostic_on_sentence_finals():
 
 
 # --------------------------------------------------------------- alignment
+
+def test_pause_markers_are_inserted_and_stripped():
+    # 2026-11-15: the model used to see flattened text and could not know a
+    # 3 s silence separated two short utterances (measured: a line spanning a
+    # 16.8 s gap). A marker line states the length; the text itself is
+    # untouched, so the verbatim alignment contract survives.
+    words = [Word("あ", 0.0, 0.4, "1"), Word("い", 0.5, 0.9, "2"),
+             Word("う", 4.0, 4.4, "1")]        # 3.1 s silence before う
+    marked = marked_text(words)
+    assert "⟪PAUSE 3.1s⟫" in marked
+    assert "あい" in marked and "う" in marked
+    # stripping the marker (and the newline its insertion added) gives back
+    # exactly the plain join -- that is what keeps alignment exact
+    assert strip_pause_markers(marked) == join_words(words)
+    # a short gap is not a marker
+    assert "PAUSE" not in marked_text(words[:2])
+
+
+def test_model_echoing_a_pause_marker_still_aligns():
+    """The prompt forbids echoing markers; if a model does it anyway the parse
+    step strips them, so alignment cannot fail on a hint."""
+    t = _task(1, "あいう。")
+    content = '{"results": [{"id": 1, "lines": ["⟪PAUSE 2.0s⟫ あい", "う。"]}]}'
+    parsed = ProtocolSplitter._parse(content)
+    assert parsed == {1: ["あい", "う。"]}
+    pieces = _align_lines(parsed[1], t.words)
+    assert [join_words(pc) for pc in pieces] == ["あい", "う。"]
+
 
 def test_align_lines_exact_and_whitespace_tolerant():
     t = _task(1, "あいう。かきく。")

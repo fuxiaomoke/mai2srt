@@ -16,7 +16,7 @@ import {
 } from '../lib/api';
 import {
   playerLoad, playerPause, playerPlaySegment, playerSeek, playerUnload,
-  usePlayer,
+  usePlayerSelector,
 } from '../lib/player';
 import {
   PARAM_SPECS, fmtEntryTime, glueText, isDialogueText, isPunctuation,
@@ -111,7 +111,12 @@ export function RefinePage() {
   const [delIdx, setDelIdx] = useState<number | null>(null);
   // playback audio binding for the current file (from /api/preview)
   const [audioInfo, setAudioInfo] = useState<AudioInfo | null>(null);
-  const player = usePlayer();
+  // playback state arrives as SLICES, never as the whole store: the clock is
+  // published at ~10 Hz, and this page renders a 400+-row subtitle list. A
+  // slice that did not change re-renders nothing (lib/player doc, 2026-11-15)
+  const playerPlaying = usePlayerSelector((s) => s.playing);
+  const playerFollow = usePlayerSelector((s) => s.follow);
+  const playerDurationMs = usePlayerSelector((s) => s.durationMs);
   const toast = useToast();
   // explains the two-click model on the first arm of the launch, whichever
   // delete in the app gets there first (shared with ConfirmIconButton)
@@ -153,7 +158,7 @@ export function RefinePage() {
   // playing locks the same edit/param controls as llmBusy, for a structural
   // reason: the playhead maps onto entries and word indices, so nothing
   // that moves them may run while audio is live
-  const locked = llmBusy || player.playing;
+  const locked = llmBusy || playerPlaying;
   // one focused inline operation at a time: while a text editor is open
   // (a DRAFT may be pending) the structural row tools are disabled --
   // implicitly closing the editor would strand the draft. Scissors and
@@ -172,7 +177,7 @@ export function RefinePage() {
   // (restoring moves the word indices the playhead maps onto), editOpen
   // (the open draft's textarea owns Ctrl+Z), and the save awaits (the
   // POST must not race a screen swap)
-  const histLock = busy || player.playing || editOpen || saving || savingEdit;
+  const histLock = busy || playerPlaying || editOpen || saving || savingEdit;
   const canUndo = !histLock && undoStack.length > 0;
   const canRedo = !histLock && redoStack.length > 0;
   // Ctrl+S mirrors the saveEdit button's enable condition, except it
@@ -445,10 +450,15 @@ export function RefinePage() {
   // back is instant (no re-download / re-decode)
   useEffect(() => () => playerPause(), []);
 
-  /** the entry the playhead is inside (-1 = stopped / between entries) */
-  const playingIdx = useMemo(() => {
-    if (!player.playing) return -1;
-    const t = player.currentMs / 1000;
+  /** the entry the playhead is inside (-1 = stopped / between entries).
+   *  Derived through a store SELECTOR rather than a useMemo over the raw
+   *  clock: the snapshot is a row index, so a tick that stays inside the
+   *  same row commits nothing. The search closes over entries/words, and
+   *  the selector is rebuilt every render, so it always sees the current
+   *  screen -- the row can never go stale after an edit moves boundaries. */
+  const playingIdx = usePlayerSelector((s) => {
+    if (!s.playing) return -1;
+    const t = s.currentMs / 1000;
     let lo = 0;
     let hi = entries.length - 1;
     while (lo <= hi) {
@@ -461,26 +471,26 @@ export function RefinePage() {
       else return mid;
     }
     return -1;
-  }, [player.playing, player.currentMs, entries, words]);
+  });
 
   /** the row whose one-shot listen segment is currently playing (-1 none) */
-  const segmentRow = useMemo(() => {
-    if (!player.playing || !player.segment) return -1;
-    const segStart = player.segment.startMs;
+  const segmentRow = usePlayerSelector((s) => {
+    if (!s.playing || !s.segment) return -1;
+    const segStart = s.segment.startMs;
     return entries.findIndex((e) => {
       const w0 = words[e.w0];
       return !!w0 && Math.abs(w0.start * 1000 - segStart) < 300;
     });
-  }, [player.playing, player.segment, entries, words]);
+  });
 
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
   // follow mode: the playing row is centered in the viewport, not nudged
   // in at the nearest edge -- with 'nearest' every new row entered at the
   // BOTTOM of the list, so the user ended up reading along the floor
   useEffect(() => {
-    if (playingIdx < 0 || !player.follow) return;
+    if (playingIdx < 0 || !playerFollow) return;
     rowRefs.current[playingIdx]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }, [playingIdx, player.follow]);
+  }, [playingIdx, playerFollow]);
 
   /** listen-to-this-line: one-shot segment play; clicking the playing row's
    *  button again stops it (the button stays visible while its row plays) */
@@ -507,7 +517,7 @@ export function RefinePage() {
     // the split word-chip panel too -- clicking there picks a cut point,
     // not the row
     if ((ev.target as HTMLElement).closest('button, textarea, input, a, [data-noseek]')) return;
-    if (!player.follow) return;
+    if (!playerFollow) return;
     const w0 = words[entries[i]?.w0];
     if (!w0) return;
     playerSeek(w0.start * 1000);
@@ -1055,7 +1065,7 @@ export function RefinePage() {
               variant="ghost"
               lift
               busy={busy && useLlm}
-              disabled={!path || busy || player.playing}
+              disabled={!path || busy || playerPlaying}
               onClick={() => setUseLlm(true)}
             >
               <Wand2 size={14} strokeWidth={2} /> {t('r.llm.run')}
@@ -1154,7 +1164,7 @@ export function RefinePage() {
           {path && (
             <button
               onClick={restoreArchive}
-              disabled={busy || player.playing}
+              disabled={busy || playerPlaying}
               title={t('r.hint.restoreArchive')}
               className="text-primary transition-opacity hover:underline disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -1254,8 +1264,8 @@ export function RefinePage() {
             // this row's one-shot segment is what the player is inside
             const rowPlaying = i === segmentRow;
             // listen is unavailable when the row starts beyond the audio
-            const beyond = player.durationMs > 0 && !!words[e.w0] &&
-              words[e.w0].start * 1000 >= player.durationMs;
+            const beyond = playerDurationMs > 0 && !!words[e.w0] &&
+              words[e.w0].start * 1000 >= playerDurationMs;
             return (
             <motion.div
               key={`${e.w0}-${e.w1}-${i}`}
@@ -1273,7 +1283,7 @@ export function RefinePage() {
                     ? 'border-primary/30 bg-primary-dim'
                     : 'border-transparent hover:border-line-1'
               } ${i === playingIdx ? 'bg-primary-dim ring-1 ring-primary/60' : ''} ${
-                player.follow && audioInfo?.resolved ? 'cursor-pointer' : ''
+                playerFollow && audioInfo?.resolved ? 'cursor-pointer' : ''
               }`}
             >
               {/* playing-row marker: a bold bar straddling the left edge,
@@ -1336,7 +1346,7 @@ export function RefinePage() {
                       setEditingIdx(i);
                       setEditDraft(e.text);
                     }}
-                    disabled={player.playing}
+                    disabled={playerPlaying}
                     className="grid h-6 w-6 place-items-center rounded text-ink-3 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                     title={t('r.editText')}
                   >
@@ -1354,7 +1364,7 @@ export function RefinePage() {
                        and the pencil (the one safe switcher) can be clicked.
                        Hopping straight from an armed delete into a cut -- or
                        back -- is how a pending decision gets lost. */
-                    disabled={player.playing || (toolOpen && splitIdx !== i)}
+                    disabled={playerPlaying || (toolOpen && splitIdx !== i)}
                     className={`grid h-6 w-6 place-items-center rounded hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40 ${
                       splitIdx === i ? 'text-primary' : 'text-ink-3 hover:text-primary'
                     }`}
@@ -1379,7 +1389,7 @@ export function RefinePage() {
                     /* same mutual exclusion as the scissors: an armed delete
                        cannot be reached from an open split panel (nor from an
                        editor), only from a row with no tool open */
-                    disabled={player.playing || (toolOpen && delIdx !== i)}
+                    disabled={playerPlaying || (toolOpen && delIdx !== i)}
                     /* hover lives inside each branch: a shared hover:bg-hover
                        would override the armed tint exactly when the pointer
                        is on the button, i.e. just before the confirm click */
@@ -1411,7 +1421,7 @@ export function RefinePage() {
                   {i > 0 && (
                     <button
                       onClick={() => mergeWithNext(i - 1)}
-                      disabled={player.playing || toolOpen}
+                      disabled={playerPlaying || toolOpen}
                       className="grid h-6 w-6 place-items-center rounded text-ink-3 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                       title={t('r.mergePrev')}
                     >
@@ -1421,7 +1431,7 @@ export function RefinePage() {
                   {i < entries.length - 1 && (
                     <button
                       onClick={() => mergeWithNext(i)}
-                      disabled={player.playing || toolOpen}
+                      disabled={playerPlaying || toolOpen}
                       className="grid h-6 w-6 place-items-center rounded text-ink-3 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                       title={t('r.mergeNext')}
                     >
@@ -1465,7 +1475,7 @@ export function RefinePage() {
                    draft would collide with the follow highlight) */
                 <div
                   onClick={() => {
-                    if (player.playing) return;
+                    if (playerPlaying) return;
                     // click-anywhere-in-the-text entry (the dashed affordance on
                     // hover): it closes whatever tool is open first -- including
                     // the split panel on THIS row -- and commits a draft from
@@ -1476,7 +1486,7 @@ export function RefinePage() {
                   }}
                   title={t('r.editText')}
                   className={`mt-1 rounded-(--radius-s) border border-transparent px-2 py-1 transition-colors duration-(--dur-in) ${
-                    player.playing
+                    playerPlaying
                       ? 'cursor-not-allowed'
                       : 'cursor-text hover:border-dashed hover:border-primary/60 hover:bg-hover'
                   }`}
@@ -1527,7 +1537,7 @@ export function RefinePage() {
                             {si < spans.length - 1 && (
                               <button
                                 onClick={() => splitAt(i, sp.t - e.w0)}
-                                disabled={player.playing}
+                                disabled={playerPlaying}
                                 className="mx-1 grid h-5 w-4 place-items-center rounded text-ink-2 transition-colors hover:bg-primary-dim hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                                 title={t('r.split')}
                               >
@@ -1565,7 +1575,7 @@ export function RefinePage() {
                           {wi < e.w1 - e.w0 && (
                             <button
                               onClick={() => splitAt(i, wi)}
-                              disabled={player.playing}
+                              disabled={playerPlaying}
                               className="mx-0.5 grid h-4 w-3 place-items-center rounded text-ink-2 transition-colors hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                               title={t('r.split')}
                             >

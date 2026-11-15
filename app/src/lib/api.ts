@@ -224,6 +224,10 @@ export interface DoneData {
   // None/absent = LLM off or fully applied; a string = some or all over-limit
   // runs fell back to the deterministic split (quality loss, worth a warning)
   llm_note?: string | null;
+  // 1-based numbers of the audio pieces the server reported as speechless and
+  // that were skipped (issue #5). The run still succeeded -- but a stretch of
+  // the media produced no subtitles, which the user deserves to know.
+  silent_chunks?: number[];
   // login job: the biometric-notice check made in the still-open login
   // browser (issue #1). consent_needed=true -> the settings-page consent
   // button should be promoted/highlighted; consent_accepted=true -> the
@@ -266,6 +270,10 @@ export async function createJob(body: {
   mai_json_path?: string;
   use_llm?: boolean;
   params?: Record<string, number | boolean>;
+  /** interface language for the job's USER log lines; the detail log stays
+   *  English. Pinned per job, so a mid-run language switch only affects the
+   *  next one. */
+  lang?: "zh" | "en";
 }): Promise<JobInfo> {
   const r = await fetch(`${API_BASE}/api/jobs`, {
     method: "POST",
@@ -283,6 +291,17 @@ export async function cancelJob(id: string): Promise<void> {
   if (!r.ok) throw new Error(`cancel: HTTP ${r.status}`);
 }
 
+/** Every job the backend still remembers, newest first.
+ *
+ *  The UI uses this for exactly one thing: after a webview reload it has no job
+ *  id of its own, and the backend is the only place that knows whether a run
+ *  outlived the document (see jobSession.jobBoot). Not a history browser. */
+export async function listJobs(): Promise<JobInfo[]> {
+  const r = await fetch(`${API_BASE}/api/jobs`);
+  if (!r.ok) throw new Error(`jobs: HTTP ${r.status}`);
+  return (await r.json()).jobs;
+}
+
 /** Reveal a file selected in its containing folder (explorer /select). */
 export async function revealPath(path: string): Promise<void> {
   const r = await fetch(`${API_BASE}/api/reveal`, {
@@ -298,7 +317,10 @@ export function subscribeJob(
   jobId: string,
   handlers: {
     onStage?: (stage: string, detail: string) => void;
-    onLog?: (line: string) => void;
+    /** `detail` marks the diagnostic stream (dB figures, per-chunk numbers):
+     *  it is hidden behind a button, but it always runs, so a bug report can
+     *  attach it without the user having had to look at it while working. */
+    onLog?: (line: string, detail: boolean) => void;
     onDone?: (data: DoneData) => void;
     onError?: (message: string) => void;
     onCancelled?: () => void;
@@ -310,7 +332,8 @@ export function subscribeJob(
     handlers.onStage?.(d.stage, d.detail ?? "");
   });
   es.addEventListener("log", (e) => {
-    handlers.onLog?.(JSON.parse((e as MessageEvent).data).line);
+    const d = JSON.parse((e as MessageEvent).data);
+    handlers.onLog?.(d.line, d.detail === true);
   });
   es.addEventListener("done", (e) => {
     handlers.onDone?.(JSON.parse((e as MessageEvent).data));
@@ -732,6 +755,60 @@ export async function openProject(path: string): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
+  });
+  if (!r.ok) throw new Error(await errText(r));
+}
+
+/* --------------------------------------------------------------- updates */
+
+export interface UpdateInfo {
+  version: string;
+  /** release page (or an asset URL, when the source is a static latest.json) */
+  url: string;
+  notes: string;
+  published_at: string;
+}
+
+export interface UpdateStatus {
+  current: string;
+  /** automatic checks on/off. A manual check works either way -- that is the
+   *  difference between "phoning home on a timer" and "I clicked a button". */
+  auto: boolean;
+  /** the endpoint that answered; a mirror can be set in config.json */
+  url: string;
+  checked_at: string | null;
+  latest: UpdateInfo | null;
+  error: string | null;
+}
+
+/** Ask whether a newer release exists. Cached in the backend for 24 h, so the
+ *  shell can call this freely; `force` is the card's "check now" button. */
+export async function checkUpdate(force = false): Promise<UpdateStatus> {
+  const r = await fetch(`${API_BASE}/api/update${force ? '?force=1' : ''}`);
+  if (!r.ok) throw new Error(`update: HTTP ${r.status}`);
+  return r.json();
+}
+
+export async function setUpdateAuto(
+  auto: boolean,
+): Promise<{ auto: boolean; url: string }> {
+  const r = await fetch(`${API_BASE}/api/update`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto }),
+  });
+  if (!r.ok) throw new Error(await errText(r));
+  return r.json();
+}
+
+/** Open an http(s) URL in the user's real browser. Server-side for the same
+ *  reason as /api/reveal -- and because the backend owns the scheme
+ *  allowlist (a webview should not decide what is safe to launch). */
+export async function openUrl(url: string): Promise<void> {
+  const r = await fetch(`${API_BASE}/api/open_url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
   });
   if (!r.ok) throw new Error(await errText(r));
 }

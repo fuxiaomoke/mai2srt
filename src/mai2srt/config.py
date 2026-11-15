@@ -42,13 +42,55 @@ MP3_BITRATE_MAX_BPS = 192_000
 #: pieces at 29 min, one minute under the 32-min report.
 MAX_SINGLE_UPLOAD_SECONDS = 1800.0
 
-#: chunking — chunks never exceed the target (cuts land at/below each
-#: boundary); at the 64 kbps floor 1740s costs ~13.3 MiB raw, far inside
-#: the 25 MiB limit. 29 min keeps every piece below the 32-minute
-#: diarization failure threshold (see MAX_SINGLE_UPLOAD_SECONDS note).
+#: chunking — pieces never exceed the target; at the 64 kbps floor 1740s costs
+#: ~13.3 MiB raw, far inside the 25 MiB limit. 29 min keeps every piece below
+#: the 32-minute diarization failure threshold (see
+#: MAX_SINGLE_UPLOAD_SECONDS note). The planner splits into the FEWEST
+#: balanced pieces -- n = ceil(D / this) of ~D/n -- so lengths stay even
+#: instead of "fill to the cap, then dump the remainder".
 CHUNK_TARGET_SECONDS = 1740.0
+
+#: floor for a piece. Balanced splitting already guarantees target/2 = 14.5
+#: min for anything that chunks at all (issue #5: the old max-fill plan ended
+#: every source with a 2-6s residual stub, and a stub that short is almost
+#: always the media's quiet tail -- HTTP 422 "No speech was found in this
+#: audio", which used to fail the whole run). This remains as a guard for the
+#: placement edge cases: a cut may never leave a piece shorter than this.
+MIN_CHUNK_S = 45.0
+#: last-resort fixed silence line, used only when the peak cannot be measured
 SILENCE_NOISE_DB = -40.0
+
+#: HOW quiet counts as a pause. A fixed absolute line is wrong for real
+#: recordings: a normalised master puts its pauses at -55 dBFS, while a
+#: recording with room tone bottoms out at -38 dBFS -- one fixed number
+#: misses one of them, and missing them means every cut becomes a hard cut
+#: (issue #5's origin). So the line is derived from the material:
+#: "SILENCE_REL_DB below the loudest moment".
+SILENCE_REL_DB = 30.0
+#: the derived line is clamped into this band so a wild transient cannot
+#: drag it somewhere useless
+SILENCE_DB_MIN = -70.0
+SILENCE_DB_MAX = -15.0
+#: a peak below this means there is no signal at all (16-bit digital
+#: silence reads about -91 dB), i.e. nothing to transcribe
+SILENCE_PEAK_FLOOR_DB = -50.0
+#: a scan that calls more than this fraction of the media "quiet" is not
+#: believable -- usually a single loud bang dragging the peak, hence the line,
+#: far too low. One corrective re-scan, SILENCE_RETRY_DB in the other
+#: direction, decides whether to trust the map at all.
+SILENCE_SANITY_COVERAGE = 0.85
+SILENCE_RETRY_DB = 12.0
+#: only pauses at least this long are offered as CUT candidates (a 0.3 s
+#: breath is too tight to cut inside); all of them still count as quiet
+CUT_MIN_GAP_S = 0.8
+#: how far a cut may slide off the even split, as a fraction of the ideal
+#: chunk length. Balances "land in a real pause" against "keep chunks even".
+SNAP_WINDOW_RATIO = 0.15
+
 SILENCE_MIN_S = 0.3
+
+#: shown to the user when a whole file turns out to be speechless
+#: (language-resolved through messages.tr -- see src/mai2srt/messages.py)
 
 #: upload behaviour
 UPLOAD_ATTEMPTS = 3
@@ -65,6 +107,10 @@ def default_data_dir() -> Path:
 @dataclass
 class Config:
     data_dir: Path = field(default_factory=default_data_dir)
+    #: language of the USER log (the lines the Transcribe page shows). The
+    #: server sets it per job from the request, the CLI from --lang, so one
+    #: run never mixes languages. The detail/file logs stay English.
+    lang: str = "zh"
 
     @property
     def profile_dir(self) -> Path:
